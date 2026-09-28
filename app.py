@@ -39,41 +39,46 @@ def rsi_calc(prices, period=7):
     rs = gains / losses
     return 100 - (100 / (1 + rs))
 
-def loop():
+def bot_loop():
     base = get_base_price()
     state["price"] = base
     state["prices"].append(base)
-    add_log(f"DEMO READY - WIN $1.5 LOSS $0.8 - Fair")
+    add_log("DEMO READY - WIN $1.5 LOSS $0.8")
     last_trade = 0
     while True:
-        if state["running"]:
-            price = state["price"] + random.uniform(-0.0008, 0.0008)
-            state["price"] = price
-            state["prices"].append(price)
-            rsi = rsi_calc(list(state["prices"])) + random.uniform(-2, 2)
-            rsi = max(5, min(95, rsi))
-            state["rsi"] = round(rsi, 1)
+        try:
+            if state["running"]:
+                price = state["price"] + random.uniform(-0.0008, 0.0008)
+                state["price"] = price
+                state["prices"].append(price)
+                rsi = rsi_calc(list(state["prices"])) + random.uniform(-2, 2)
+                rsi = max(5, min(95, rsi))
+                state["rsi"] = round(rsi, 1)
 
-            # Trade only every 8 seconds
-            if time.time() - last_trade > 8:
-                action = None
-                if rsi < 35: action = "BUY"
-                elif rsi > 65: action = "SELL"
+                if time.time() - last_trade > 8:
+                    action = None
+                    if rsi < 35: action = "BUY"
+                    elif rsi > 65: action = "SELL"
+                    if action:
+                        last_trade = time.time()
+                        win = random.random() < 0.58
+                        profit = 1.50 if win else -0.80
+                        state["balance"] = round(state["balance"] + profit, 2)
+                        state["trades"].insert(0, {
+                            "time": datetime.now().strftime('%H:%M:%S'),
+                            "type": action,
+                            "price": round(price,5),
+                            "rsi": round(rsi,1),
+                            "profit": profit,
+                            "bal": state["balance"]
+                        })
+                        result = f"WIN +${profit}" if win else f"LOSS ${profit}"
+                        add_log(f"{action} EURUSD {round(price,5)} RSI {round(rsi,1)} {result} Bal ${state['balance']}")
+            time.sleep(3)
+        except Exception as e:
+            add_log(f"Error {e}")
+            time.sleep(3)
 
-                if action:
-                    last_trade = time.time()
-                    win = random.random() < 0.58 # 58% win rate
-                    profit = 1.50 if win else -0.80 # WIN BIG, LOSS SMALL
-                    state["balance"] = round(state["balance"] + profit, 2)
-                    trade = {
-                        "time": datetime.now().strftime('%H:%M:%S'),
-                        "type": action,
-                        "price": round(price,5),
-                        "rsi": round(rsi,1),
-                        "profit": profit,
-                        "bal": state["balance"]
-                    }
-                    state["trades"].insert(0, trade)
-                    result = f"WIN +${profit}" if win else f"LOSS ${profit}"
-                    add_log(f"{action} EURUSD {round(price,5)} RSI {round(rsi,1)} {result} Bal ${state['balance']}")
-        time.sleep(3
+threading.Thread(target=bot_loop, daemon=True).start()
+
+HTML =
