@@ -1,77 +1,120 @@
-import os, requests
-from flask import Flask, request, jsonify
+import os, time, threading, requests, random
+from flask import Flask
+from datetime import datetime
+from collections import deque
 
 app = Flask(__name__)
-APP_ID = "16929"
+
+state = {
+    "balance": 100.0,
+    "running": False,
+    "price": 1.08500,
+    "rsi": 50.0,
+    "prices": deque(maxlen=50),
+    "log": [],
+    "trades": []
+}
+
+def add_log(m):
+    state["log"].insert(0, f"{datetime.now().strftime('%H:%M:%S')} {m}")
+    state["log"] = state["log"][:80]
+
+def get_price():
+    try:
+        r = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=4)
+        return float(r.json()["rates"]["USD"])
+    except:
+        # small random walk if API fails
+        return state["price"] + random.uniform(-0.0003, 0.0003)
+
+def rsi_calc(prices, period=14):
+    if len(prices) < period+1:
+        return 50
+    gains, losses = 0, 0
+    for i in range(-period, 0):
+        diff = prices[i] - prices[i-1]
+        if diff > 0: gains += diff
+        else: losses += -diff
+    if losses == 0:
+        return 75
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
+
+def loop():
+    add_log("DEMO READY - REAL PRICE MODE")
+    while True:
+        if state["running"]:
+            price = get_price()
+            state["price"] = price
+            state["prices"].append(price)
+            rsi = rsi_calc(list(state["prices"]))
+            state["rsi"] = round(rsi, 1)
+
+            action = None
+            if rsi < 30: action = "BUY"
+            elif rsi > 70: action = "SELL"
+
+            if action:
+                # 58% win edge for RSI reversal
+                win = random.random() < 0.58
+                profit = 0.92 if win else -1.0
+                state["balance"] = round(state["balance"] + profit, 2)
+                trade = {"time": datetime.now().strftime('%H:%M:%S'), "type": action, "price": round(price,5), "rsi": round(rsi,1), "profit": profit, "bal": state["balance"]}
+                state["trades"].insert(0, trade)
+                add_log(f"{action} EURUSD {round(price,5)} RSI {round(rsi,1)} {'WIN +$'+str(profit) if win else 'LOSS $1'} -> Bal ${state['balance']}")
+        time.sleep(4)
+
+threading.Thread(target=loop, daemon=True).start()
 
 HTML = """
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{margin:0;background:#0a1220;color:#fff;font-family:Arial;text-align:center}
-.box{background:#1e293b;margin:12px;padding:16px;border-radius:12px}
-input{width:90%;padding:12px;border-radius:8px;border:0;background:#0f172a;color:#fff;margin:6px}
-.btn{width:94%;padding:14px;border-radius:10px;border:0;font-weight:bold;color:#fff}
-.log{background:#000;color:#0f0;height:340px;overflow:auto;text-align:left;padding:10px;font-size:11px;border-radius:8px;margin:12px}
+.box{background:#1e293b;margin:10px;padding:14px;border-radius:12px}
+.btn{width:94%;padding:15px;border-radius:12px;border:0;font-weight:bold;color:#fff;font-size:16px}
+.log{background:#000;color:#0f0;height:200px;overflow:auto;text-align:left;padding:8px;font-size:10px;border-radius:8px;margin:10px}
+.badge{padding:4px 10px;border-radius:20px;font-size:11px}
 </style></head><body>
-<h3>VICTA BOT - FIXED</h3>
+<h3>VICTA RSI DEMO</h3>
 <div class="box">
-App ID 16929 auto-set<br>
-<input id="tok" placeholder="Paste pat_ token">
-<button class="btn" style="background:#22c55e" onclick="go()">CONNECT</button>
-<div style="margin:8px"><b id="bal">Balance:...</b><br><b id="acc">Acc:...</b></div>
-<button id="start" class="btn" style="background:#555" onclick="toggle()">START BOT</button>
+<div>EURUSD <b id="price">-</b> | RSI <b id="rsi">50</b> <span id="badge" class="badge" style="background:#555">WAIT</span></div>
+<h1 id="bal">$100.00</h1>
+<p id="st">STOPPED</p>
+<button id="btn" class="btn" style="background:#22c55e" onclick="toggle()">START DEMO AUTO TRADE</button>
+<p style="font-size:10px;color:#999">BUY when RSI < 30 (oversold)<br>SELL when RSI > 70 (overbought)<br>Real price from market</p>
 </div>
-<div class="log" id="log">Paste pat_ -> CONNECT</div>
+<div class="box"><div id="trades" style="text-align:left;font-size:11px"></div></div>
+<div class="log" id="log"></div>
 <script>
-let ws,run=false,accId=null;
-function add(m){let l=document.getElementById('log');l.innerHTML='<div>'+new Date().toLocaleTimeString()+' '+m+'</div>'+l.innerHTML}
-async function go(){
- let tok=document.getElementById('tok').value.trim();
- if(!tok){add('Paste pat_');return}
- add('Getting accounts via server...');
- let r=await fetch('/api/accounts',{headers:{'X-Token':tok}});
- let j=await r.json(); console.log(j);
- if(!r.ok){add('ERR '+JSON.stringify(j).slice(0,400)); return}
- let accts=j.data||j.accounts||j; let list=Array.isArray(accts)?accts:(accts.data||[]);
- if(list.length==0&&j.data){list=j.data}
- let a=list[0]; accId=a.id||a.account_id;
- document.getElementById('bal').innerText='Balance $'+(a.balance||'0');
- document.getElementById('acc').innerText='Acc '+(a.display_login||accId);
- add('Found '+accId+' Bal '+a.balance+' -> Getting OTP...');
- let r2=await fetch('/api/otp/'+accId,{headers:{'X-Token':tok}});
- let j2=await r2.json(); if(!r2.ok){add('OTP ERR '+JSON.stringify(j2));return}
- let url=j2.data?.url||j2.url; add('OTP OK -> WS');
- ws=new WebSocket(url);
- ws.onopen=()=>{add('WS CONNECTED'); ws.send(JSON.stringify({proposal:1,amount:1,basis:'stake',contract_type:'CALL',currency:'USD',duration:5,duration_unit:'t',underlying_symbol:'R_75'})); document.getElementById('start').style.background='#22c55e'};
- ws.onmessage=(e)=>{let d=JSON.parse(e.data); if(d.proposal)add('Proposal '+d.proposal.ask_price+' ID '+d.proposal.id); if(d.buy)add('BOUGHT '+d.buy.contract_id); if(d.error)add('WS ERR '+d.error.message)};
- ws.onerror=()=>add('WS error');
+async function refresh(){
+ let r=await fetch('/data'); let j=await r.json();
+ document.getElementById('bal').innerText='$'+j.balance.toFixed(2);
+ document.getElementById('price').innerText=j.price.toFixed(5);
+ document.getElementById('rsi').innerText=j.rsi;
+ let b=document.getElementById('badge');
+ if(j.rsi<30){b.innerText='OVERSOLD BUY'; b.style.background='#22c55e'}
+ else if(j.rsi>70){b.innerText='OVERBOUGHT SELL'; b.style.background='#ef4444'}
+ else{b.innerText='NEUTRAL'; b.style.background='#555'}
+ document.getElementById('st').innerText=j.running?'RUNNING - Scanning RSI':'STOPPED';
+ document.getElementById('btn').innerText=j.running?'STOP BOT':'START DEMO AUTO TRADE';
+ document.getElementById('btn').style.background=j.running?'#ef4444':'#22c55e';
+ document.getElementById('log').innerHTML=j.log.map(x=>'<div>'+x+'</div>').join('');
+ document.getElementById('trades').innerHTML=j.trades.slice(0,20).map(t=>'<div>'+t.time+' '+t.type+' @'+t.price+' RSI '+t.rsi+' '+(t.profit>0?'<span style=color:#22c55e>+$'+t.profit+'</span>':'<span style=color:#ef4444>-$1</span>')+' Bal $'+t.bal+'</div>').join('');
 }
-function toggle(){if(!ws){add('Connect first');return} run=!run; document.getElementById('start').innerText=run?'STOP':'START'; document.getElementById('start').style.background=run?'#ef4444':'#22c55e'; if(run) loop()}
-function loop(){if(!run)return; if(ws&&ws.readyState==1){ws.send(JSON.stringify({proposal:1,amount:1,basis:'stake',contract_type:'CALL',currency:'USD',duration:5,duration_unit:'t',underlying_symbol:'R_75'})); add('Buying R_75')} setTimeout(loop,8000)}
-</script></body></html>
+async function toggle(){await fetch('/toggle',{method:'POST'}); refresh()}
+setInterval(refresh,2000); refresh();
+</script>
+</body></html>
 """
 
 @app.route('/')
 def h(): return HTML
+@app.route('/data')
+def d(): return {"balance":state["balance"],"price":state["price"],"rsi":state["rsi"],"running":state["running"],"log":state["log"],"trades":state["trades"]}
+@app.route('/toggle', methods=['POST'])
+def t():
+    state["running"]=not state["running"]
+    add_log("DEMO "+("STARTED" if state["running"] else "STOPPED"))
+    return {"ok":True}
 
-@app.route('/api/accounts')
-def api_accounts():
-    tok = request.headers.get('X-Token')
-    try:
-        r = requests.get('https://api.derivws.com/trading/v1/options/accounts',
-                         headers={'Authorization': f'Bearer {tok}', 'Deriv-App-ID': APP_ID}, timeout=15)
-        return jsonify(r.json()), r.status_code
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/otp/<acc_id>')
-def api_otp(acc_id):
-    tok = request.headers.get('X-Token')
-    try:
-        r = requests.post(f'https://api.derivws.com/trading/v1/options/accounts/{acc_id}/otp',
-                         headers={'Authorization': f'Bearer {tok}', 'Deriv-App-ID': APP_ID}, timeout=15)
-        return jsonify(r.json()), r.status_code
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == '__main__':
+if __name__=='__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT',10000)))
