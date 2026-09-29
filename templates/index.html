@@ -1,1 +1,639 @@
+<!DOCTYPE html>
+<html>
+<head>
 
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1">
+
+<title>VIC FX SIGNALS</title>
+
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #050812;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+header {
+    padding: 25px 15px;
+    text-align: center;
+    background: linear-gradient(
+        135deg,
+        #101b4d,
+        #56146e,
+        #071d42
+    );
+    border-bottom: 2px solid #00eaff;
+}
+
+.logo {
+    font-size: 28px;
+    font-weight: 900;
+    color: #00eaff;
+}
+
+.subtitle {
+    margin-top: 8px;
+    color: #b8c8ef;
+    font-size: 13px;
+}
+
+.container {
+    max-width: 1200px;
+    margin: auto;
+    padding: 15px;
+}
+
+.status {
+    padding: 15px;
+    margin-bottom: 15px;
+    border-radius: 15px;
+    background: #0c1428;
+    border: 1px solid #243d70;
+    display: flex;
+    justify-content: space-between;
+}
+
+.online {
+    color: #00ff9d;
+    font-weight: bold;
+}
+
+.updated {
+    color: #8498c2;
+    font-size: 12px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit, minmax(330px, 1fr));
+    gap: 18px;
+}
+
+.card {
+    overflow: hidden;
+    border-radius: 18px;
+    background: linear-gradient(
+        145deg,
+        #111b34,
+        #070c18
+    );
+    border: 1px solid #263d6d;
+    box-shadow: 0 10px 35px #0009;
+}
+
+.cardtop {
+    padding: 15px;
+    display: flex;
+    justify-content: space-between;
+    border-bottom: 1px solid #263657;
+}
+
+.pair {
+    font-size: 21px;
+    font-weight: bold;
+}
+
+.timeframe {
+    color: #91a7d6;
+}
+
+.signal {
+    margin: 14px;
+    padding: 13px;
+    text-align: center;
+    border-radius: 12px;
+    font-size: 23px;
+    font-weight: 900;
+}
+
+.BUY {
+    background: #063e2d;
+    color: #00ff9d;
+    border: 1px solid #00ff9d;
+}
+
+.SELL {
+    background: #46152b;
+    color: #ff5475;
+    border: 1px solid #ff5475;
+}
+
+.WAIT {
+    background: #44370a;
+    color: #ffd83d;
+    border: 1px solid #ffd83d;
+}
+
+.NO-DATA {
+    background: #252a36;
+    color: #aeb8c9;
+}
+
+.chart {
+    height: 270px;
+    margin: 10px;
+}
+
+.data {
+    padding: 5px 14px 18px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.box {
+    padding: 10px;
+    background: #0b1427;
+    border: 1px solid #263b65;
+    border-radius: 10px;
+}
+
+.label {
+    color: #7187b4;
+    font-size: 10px;
+    margin-bottom: 5px;
+}
+
+.value {
+    font-weight: bold;
+}
+
+.entry {
+    color: #00eaff;
+}
+
+.stop {
+    color: #ff5475;
+}
+
+.tp {
+    color: #00ff9d;
+}
+
+.protect {
+    color: #bd6aff;
+}
+
+.rsi {
+    color: #ffd83d;
+}
+
+footer {
+    text-align: center;
+    padding: 25px;
+    color: #64769c;
+    font-size: 12px;
+}
+
+@media(max-width:600px) {
+
+    .grid {
+        grid-template-columns: 1fr;
+    }
+
+    .logo {
+        font-size: 23px;
+    }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<header>
+
+<div class="logo">
+⚡ VIC FX SIGNALS
+</div>
+
+<div class="subtitle">
+REAL-TIME FOREX • 5 MIN • RSI • SUPPLY & DEMAND
+</div>
+
+</header>
+
+<div class="container">
+
+<div class="status">
+
+<div class="online">
+● ONLINE
+</div>
+
+<div
+class="updated"
+id="updated">
+Connecting...
+</div>
+
+</div>
+
+<div
+class="grid"
+id="cards">
+
+</div>
+
+</div>
+
+<footer>
+Twelve Data market information • Trading involves risk
+</footer>
+
+
+<script>
+
+function makeBox(
+    label,
+    value,
+    cls
+) {
+
+    if (
+        value === undefined ||
+        value === null
+    ) {
+        value = "-";
+    }
+
+    return `
+        <div class="box">
+
+            <div class="label">
+                ${label}
+            </div>
+
+            <div class="value ${cls || ""}">
+                ${value}
+            </div>
+
+        </div>
+    `;
+}
+
+
+function getSignalClass(signal) {
+
+    if (signal === "BUY") return "BUY";
+
+    if (signal === "SELL") return "SELL";
+
+    if (signal === "WAIT") return "WAIT";
+
+    return "NO-DATA";
+}
+
+
+function getSignalText(signal) {
+
+    if (signal === "BUY") return "🟢 BUY";
+
+    if (signal === "SELL") return "🔴 SELL";
+
+    if (signal === "WAIT") return "🟡 WAIT";
+
+    return "⚪ NO DATA";
+}
+
+
+function chartTime(value) {
+
+    const p = value.split(" ");
+
+    const d = p[0].split("-");
+
+    const t = p[1].split(":");
+
+    return Date.UTC(
+        Number(d[0]),
+        Number(d[1]) - 1,
+        Number(d[2]),
+        Number(t[0]),
+        Number(t[1]),
+        Number(t[2] || 0)
+    ) / 1000;
+}
+
+
+function createChartBox(
+    element,
+    candles,
+    signal
+) {
+
+    if (
+        !element ||
+        !candles ||
+        !candles.length
+    ) {
+        return;
+    }
+
+    const chart =
+        LightweightCharts.createChart(
+            element,
+            {
+                width: element.clientWidth,
+                height: 270,
+
+                layout: {
+                    background: {
+                        color: "#060b16"
+                    },
+                    textColor: "#8da4d2"
+                },
+
+                grid: {
+                    vertLines: {
+                        color: "#14213b"
+                    },
+                    horzLines: {
+                        color: "#14213b"
+                    }
+                },
+
+                timeScale: {
+                    timeVisible: true,
+                    secondsVisible: false
+                }
+            }
+        );
+
+    const series =
+        chart.addCandlestickSeries({
+            upColor: "#00d68f",
+            downColor: "#ff4f70",
+            borderUpColor: "#00d68f",
+            borderDownColor: "#ff4f70",
+            wickUpColor: "#00d68f",
+            wickDownColor: "#ff4f70"
+        });
+
+    const data = candles.map(
+        function(c) {
+
+            return {
+                time: chartTime(c.time),
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close
+            };
+
+        }
+    );
+
+    series.setData(data);
+
+    if (signal.demand) {
+
+        series.createPriceLine({
+            price: signal.demand,
+            color: "#00eaff",
+            lineWidth: 1,
+            title: "DEMAND",
+            axisLabelVisible: true
+        });
+
+    }
+
+    if (signal.supply) {
+
+        series.createPriceLine({
+            price: signal.supply,
+            color: "#ff4fd8",
+            lineWidth: 1,
+            title: "SUPPLY",
+            axisLabelVisible: true
+        });
+
+    }
+
+    if (
+        signal.signal === "BUY" ||
+        signal.signal === "SELL"
+    ) {
+
+        series.createPriceLine({
+            price: signal.entry,
+            color: "#00eaff",
+            lineWidth: 2,
+            title: "ENTRY",
+            axisLabelVisible: true
+        });
+
+        series.createPriceLine({
+            price: signal.stop,
+            color: "#ff5475",
+            title: "SL",
+            axisLabelVisible: true
+        });
+
+        series.createPriceLine({
+            price: signal.tp,
+            color: "#00ff9d",
+            title: "TP",
+            axisLabelVisible: true
+        });
+
+        series.createPriceLine({
+            price: signal.protect,
+            color: "#bd6aff",
+            title: "0.5R",
+            axisLabelVisible: true
+        });
+
+    }
+
+    chart.timeScale().fitContent();
+}
+
+
+async function load() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/dashboard",
+                {
+                    cache: "no-store"
+                }
+            );
+
+        const data =
+            await response.json();
+
+        document.getElementById(
+            "updated"
+        ).textContent =
+            data.updated;
+
+        const cards =
+            document.getElementById(
+                "cards"
+            );
+
+        cards.innerHTML = "";
+
+        data.pairs.forEach(
+            function(item, index) {
+
+                const s = item.signal;
+
+                let boxes = "";
+
+                boxes += makeBox(
+                    "PRICE",
+                    s.price,
+                    "entry"
+                );
+
+                boxes += makeBox(
+                    "RSI",
+                    s.rsi,
+                    "rsi"
+                );
+
+                boxes += makeBox(
+                    "DEMAND",
+                    s.demand,
+                    ""
+                );
+
+                boxes += makeBox(
+                    "SUPPLY",
+                    s.supply,
+                    ""
+                );
+
+                if (
+                    s.signal === "BUY" ||
+                    s.signal === "SELL"
+                ) {
+
+                    boxes += makeBox(
+                        "ENTRY",
+                        s.entry,
+                        "entry"
+                    );
+
+                    boxes += makeBox(
+                        "STOP LOSS",
+                        s.stop,
+                        "stop"
+                    );
+
+                    boxes += makeBox(
+                        "TAKE PROFIT",
+                        s.tp,
+                        "tp"
+                    );
+
+                    boxes += makeBox(
+                        "PROTECT 0.5R",
+                        s.protect,
+                        "protect"
+                    );
+
+                }
+
+                cards.innerHTML += `
+
+                    <div class="card">
+
+                        <div class="cardtop">
+
+                            <div class="pair">
+                                ${s.pair}
+                            </div>
+
+                            <div class="timeframe">
+                                5 MIN
+                            </div>
+
+                        </div>
+
+                        <div class="signal
+                            ${getSignalClass(s.signal)}">
+
+                            ${getSignalText(s.signal)}
+
+                        </div>
+
+                        <div
+                            class="chart"
+                            id="chart-${index}">
+                        </div>
+
+                        <div class="data">
+
+                            ${boxes}
+
+                        </div>
+
+                    </div>
+                `;
+
+            }
+        );
+
+        data.pairs.forEach(
+            function(item, index) {
+
+                createChartBox(
+                    document.getElementById(
+                        "chart-" + index
+                    ),
+                    item.candles,
+                    item.signal
+                );
+
+            }
+        );
+
+    } catch (error) {
+
+        console.log(error);
+
+        document.getElementById(
+            "cards"
+        ).innerHTML = `
+            <div class="card">
+                <div class="signal SELL">
+                    CONNECTION ERROR
+                </div>
+            </div>
+        `;
+
+    }
+
+}
+
+
+load();
+
+setInterval(
+    load,
+    60000
+);
+
+</script>
+
+</body>
+  </html>
