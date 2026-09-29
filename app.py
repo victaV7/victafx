@@ -27,10 +27,10 @@ PROTECT_R = 0.5
 
 
 # =========================================================
-# TWELVE DATA
+# GET TWELVE DATA
 # =========================================================
 
-def get_data(symbol):
+def get_market_data(symbol):
 
     url = "https://api.twelvedata.com/time_series"
 
@@ -51,25 +51,26 @@ def get_data(symbol):
         data = response.json()
 
         if "values" not in data:
+            print("Twelve Data error:", data)
             return None
 
         values = list(reversed(data["values"]))
 
         candles = []
 
-        for x in values:
-
+        for item in values:
             candles.append({
-                "time": x["datetime"],
-                "open": float(x["open"]),
-                "high": float(x["high"]),
-                "low": float(x["low"]),
-                "close": float(x["close"])
+                "time": item["datetime"],
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"])
             })
 
         return candles
 
-    except Exception:
+    except Exception as error:
+        print("Data error:", error)
         return None
 
 
@@ -102,11 +103,11 @@ def calculate_rsi(closes, period=14):
     for i in range(period, len(gains)):
 
         avg_gain = (
-            avg_gain * (period - 1) + gains[i]
+            (avg_gain * (period - 1)) + gains[i]
         ) / period
 
         avg_loss = (
-            avg_loss * (period - 1) + losses[i]
+            (avg_loss * (period - 1)) + losses[i]
         ) / period
 
     if avg_loss == 0:
@@ -118,12 +119,10 @@ def calculate_rsi(closes, period=14):
 
 
 # =========================================================
-# SIGNAL ENGINE
+# CREATE SIGNAL
 # =========================================================
 
-def generate_signal(symbol):
-
-    candles = get_data(symbol)
+def create_signal(symbol, candles):
 
     if not candles or len(candles) < 30:
 
@@ -133,8 +132,8 @@ def generate_signal(symbol):
         }
 
     closes = [
-        x["close"]
-        for x in candles
+        candle["close"]
+        for candle in candles
     ]
 
     rsi = calculate_rsi(
@@ -142,51 +141,51 @@ def generate_signal(symbol):
         RSI_PERIOD
     )
 
-    current = candles[-1]
+    if rsi is None:
 
-    price = current["close"]
+        return {
+            "pair": symbol,
+            "signal": "NO DATA"
+        }
+
+    price = candles[-1]["close"]
 
     recent = candles[-21:-1]
 
     demand = min(
-        x["low"]
-        for x in recent
+        candle["low"]
+        for candle in recent
     )
 
     supply = max(
-        x["high"]
-        for x in recent
+        candle["high"]
+        for candle in recent
     )
 
     # =====================================================
     # BUY
     # =====================================================
 
-    buy = (
-        price <= demand * 1.002
-        and rsi <= 40
-    )
-
-    if buy:
+    if price <= demand * 1.002 and rsi <= 40:
 
         entry = price
         stop = demand
-
         risk = entry - stop
 
         if risk > 0:
 
-            take_profit = (
-                entry + risk * RR
+            take_profit = entry + (
+                risk * RR
             )
 
-            protection = (
-                entry + risk * PROTECT_R
+            protection = entry + (
+                risk * PROTECT_R
             )
 
             return {
                 "pair": symbol,
                 "signal": "BUY",
+                "price": round(price, 5),
                 "entry": round(entry, 5),
                 "stop": round(stop, 5),
                 "tp": round(take_profit, 5),
@@ -201,31 +200,26 @@ def generate_signal(symbol):
     # SELL
     # =====================================================
 
-    sell = (
-        price >= supply * 0.998
-        and rsi >= 60
-    )
-
-    if sell:
+    if price >= supply * 0.998 and rsi >= 60:
 
         entry = price
         stop = supply
-
         risk = stop - entry
 
         if risk > 0:
 
-            take_profit = (
-                entry - risk * RR
+            take_profit = entry - (
+                risk * RR
             )
 
-            protection = (
-                entry - risk * PROTECT_R
+            protection = entry - (
+                risk * PROTECT_R
             )
 
             return {
                 "pair": symbol,
                 "signal": "SELL",
+                "price": round(price, 5),
                 "entry": round(entry, 5),
                 "stop": round(stop, 5),
                 "tp": round(take_profit, 5),
@@ -251,37 +245,27 @@ def generate_signal(symbol):
 
 
 # =========================================================
-# CANDLE API
+# DASHBOARD API
 # =========================================================
 
-@app.route("/api/candles/<path:symbol>")
-def candles_api(symbol):
-
-    candles = get_data(symbol)
-
-    if not candles:
-
-        return jsonify({
-            "error": "Unable to get market data"
-        }), 500
-
-    return jsonify(candles)
-
-
-# =========================================================
-# SIGNAL API
-# =========================================================
-
-@app.route("/api/signals")
-def signals_api():
+@app.route("/api/dashboard")
+def dashboard_api():
 
     results = []
 
     for pair in PAIRS:
 
-        results.append(
-            generate_signal(pair)
+        candles = get_market_data(pair)
+
+        signal = create_signal(
+            pair,
+            candles
         )
+
+        results.append({
+            "signal": signal,
+            "candles": candles or []
+        })
 
     return jsonify({
         "status": "success",
@@ -289,15 +273,15 @@ def signals_api():
         "updated": datetime.utcnow().strftime(
             "%H:%M:%S UTC"
         ),
-        "signals": results
+        "pairs": results
     })
 
 
 # =========================================================
-# WEB PAGE
+# WEB DASHBOARD
 # =========================================================
 
-HTML = r"""
+HTML = '''
 <!DOCTYPE html>
 
 <html>
@@ -311,8 +295,7 @@ content="width=device-width, initial-scale=1">
 
 <title>VIC FX SIGNALS</title>
 
-<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js">
-</script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 
 <style>
 
@@ -321,31 +304,21 @@ content="width=device-width, initial-scale=1">
 }
 
 body {
-
     margin: 0;
-
+    font-family: Arial, Helvetica, sans-serif;
     background:
         radial-gradient(
             circle at top,
-            #18275a,
-            #070b18 50%,
-            #02040a
+            #18275c 0%,
+            #070b18 45%,
+            #02040a 100%
         );
-
     color: white;
-
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
 }
 
 .header {
-
     text-align: center;
-
     padding: 25px 15px;
-
     background:
         linear-gradient(
             135deg,
@@ -353,271 +326,172 @@ body {
             #4b176d,
             #071c3e
         );
-
-    border-bottom:
-        2px solid #00eaff;
-
-    box-shadow:
-        0 0 30px #00eaff44;
+    border-bottom: 2px solid #00eaff;
+    box-shadow: 0 0 30px #00eaff55;
 }
 
 .logo {
-
     font-size: 29px;
-
     font-weight: 900;
-
     letter-spacing: 2px;
-
-    text-shadow:
-        0 0 15px #00eaff;
+    text-shadow: 0 0 15px #00eaff;
 }
 
 .subtitle {
-
     margin-top: 8px;
-
     color: #b8c9ff;
-
     font-size: 14px;
 }
 
 .container {
-
     max-width: 1200px;
-
     margin: auto;
-
     padding: 15px;
 }
 
 .status {
-
     display: flex;
-
     justify-content: space-between;
-
     align-items: center;
-
     margin-bottom: 15px;
-
-    padding: 14px 16px;
-
+    padding: 15px 17px;
     background: #0c1428;
-
-    border:
-        1px solid #263e70;
-
+    border: 1px solid #263e70;
     border-radius: 15px;
 }
 
 .online {
-
     color: #00ff9d;
-
     font-weight: bold;
-
-    text-shadow:
-        0 0 10px #00ff9d;
+    text-shadow: 0 0 10px #00ff9d;
 }
 
 .updated {
-
     color: #8ca3cf;
-
     font-size: 12px;
 }
 
 .grid {
-
     display: grid;
-
     grid-template-columns:
         repeat(
             auto-fit,
             minmax(330px, 1fr)
         );
-
     gap: 18px;
 }
 
 .card {
-
     background:
         linear-gradient(
             145deg,
             #101a32,
             #070d1b
         );
-
-    border:
-        1px solid #263b69;
-
+    border: 1px solid #263b69;
     border-radius: 20px;
-
     overflow: hidden;
-
-    box-shadow:
-        0 10px 35px #00000077;
+    box-shadow: 0 10px 35px #00000077;
 }
 
 .card-header {
-
     padding: 16px;
-
     display: flex;
-
     justify-content: space-between;
-
     align-items: center;
-
-    border-bottom:
-        1px solid #243657;
+    border-bottom: 1px solid #243657;
 }
 
 .pair {
-
     font-size: 21px;
-
     font-weight: 900;
 }
 
 .tf {
-
     color: #8ca9dc;
-
     font-size: 12px;
-
     background: #101e3d;
-
     padding: 6px 9px;
-
     border-radius: 8px;
 }
 
 .signal {
-
     margin: 14px;
-
     padding: 13px;
-
     border-radius: 13px;
-
     text-align: center;
-
     font-size: 23px;
-
     font-weight: 900;
-
     letter-spacing: 2px;
 }
 
 .buy {
-
     color: #00ff9d;
-
     background:
         linear-gradient(
             135deg,
             #063b2e,
             #075f40
         );
-
-    border:
-        1px solid #00ff9d;
-
-    box-shadow:
-        0 0 20px #00ff9d22;
+    border: 1px solid #00ff9d;
+    box-shadow: 0 0 20px #00ff9d33;
 }
 
 .sell {
-
     color: #ff5878;
-
     background:
         linear-gradient(
             135deg,
             #48152a,
             #701d31
         );
-
-    border:
-        1px solid #ff5878;
-
-    box-shadow:
-        0 0 20px #ff587822;
+    border: 1px solid #ff5878;
+    box-shadow: 0 0 20px #ff587833;
 }
 
 .wait {
-
     color: #ffd84a;
-
     background:
         linear-gradient(
             135deg,
             #443509,
             #5b480b
         );
-
-    border:
-        1px solid #ffd84a;
+    border: 1px solid #ffd84a;
 }
 
 .chart {
-
-    height: 260px;
-
-    margin:
-        0 10px 10px 10px;
-
+    height: 270px;
+    margin: 0 10px 10px 10px;
     border-radius: 12px;
-
     overflow: hidden;
-
     background: #060b16;
 }
 
 .data {
-
     display: grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
+    grid-template-columns: 1fr 1fr;
     gap: 9px;
-
     padding: 10px 14px 16px;
 }
 
 .box {
-
     padding: 11px;
-
     border-radius: 11px;
-
     background: #0b1427;
-
-    border:
-        1px solid #263d6c;
+    border: 1px solid #263d6c;
 }
 
 .label {
-
     color: #7188b7;
-
     font-size: 10px;
-
     font-weight: bold;
-
     margin-bottom: 5px;
 }
 
 .value {
-
     font-size: 15px;
-
     font-weight: 900;
-
     color: white;
 }
 
@@ -642,13 +516,9 @@ body {
 }
 
 .footer {
-
     text-align: center;
-
     color: #60749e;
-
     font-size: 12px;
-
     padding: 30px 15px;
 }
 
@@ -663,7 +533,7 @@ body {
     }
 
     .chart {
-        height: 240px;
+        height: 250px;
     }
 
 }
@@ -675,6 +545,7 @@ body {
 
 <body>
 
+
 <div class="header">
 
     <div class="logo">
@@ -682,13 +553,14 @@ body {
     </div>
 
     <div class="subtitle">
-        REAL 5-MIN CANDLESTICKS • SUPPLY & DEMAND • RSI
+        REAL 5-MIN CANDLES • SUPPLY & DEMAND • RSI
     </div>
 
 </div>
 
 
 <div class="container">
+
 
     <div class="status">
 
@@ -699,7 +571,7 @@ body {
         <div
             class="updated"
             id="updated">
-            Loading...
+            Connecting...
         </div>
 
     </div>
@@ -709,9 +581,16 @@ body {
         class="grid"
         id="cards">
 
-        Loading charts...
+        <div class="card">
+
+            <div class="signal wait">
+                LOADING...
+            </div>
+
+        </div>
 
     </div>
+
 
 </div>
 
@@ -726,28 +605,24 @@ body {
 
 <script>
 
-const pairs = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "AUD/USD",
-    "USD/CAD"
-];
+function number(value) {
 
+    if (value === undefined ||
+        value === null) {
 
-function formatNumber(value) {
-
-    if (value === undefined)
         return "-";
 
+    }
+
     return value;
+
 }
 
 
-function makeBox(
+function box(
     label,
     value,
-    colorClass = ""
+    color
 ) {
 
     return `
@@ -757,22 +632,26 @@ function makeBox(
                 ${label}
             </div>
 
-            <div class="value ${colorClass}">
-                ${formatNumber(value)}
+            <div
+                class="value ${color}">
+                ${number(value)}
             </div>
 
         </div>
     `;
+
 }
 
 
 function signalClass(signal) {
 
-    if (signal === "BUY")
+    if (signal === "BUY") {
         return "buy";
+    }
 
-    if (signal === "SELL")
+    if (signal === "SELL") {
         return "sell";
+    }
 
     return "wait";
 }
@@ -780,45 +659,67 @@ function signalClass(signal) {
 
 function signalText(signal) {
 
-    if (signal === "BUY")
+    if (signal === "BUY") {
         return "🟢 BUY";
+    }
 
-    if (signal === "SELL")
+    if (signal === "SELL") {
         return "🔴 SELL";
+    }
 
-    return "🟡 WAIT";
+    if (signal === "WAIT") {
+        return "🟡 WAIT";
+    }
+
+    return "⚪ NO DATA";
 }
 
 
-async function getCandles(pair) {
+function candleTime(value) {
 
-    const response =
-        await fetch(
-            "/api/candles/" +
-            encodeURIComponent(pair),
-            {
-                cache: "no-store"
-            }
-        );
+    const parts = value.split(" ");
 
-    return await response.json();
+    const dateParts =
+        parts[0].split("-");
+
+    const timeParts =
+        parts[1].split(":");
+
+    return Date.UTC(
+        parseInt(dateParts[0]),
+        parseInt(dateParts[1]) - 1,
+        parseInt(dateParts[2]),
+        parseInt(timeParts[0]),
+        parseInt(timeParts[1]),
+        parseInt(timeParts[2] || 0)
+    ) / 1000;
+
 }
 
 
-function createChart(
-    container,
+function drawChart(
+    element,
     candles,
     signal
 ) {
 
+    if (!element ||
+        !candles ||
+        candles.length === 0) {
+
+        return;
+
+    }
+
+
     const chart =
         LightweightCharts.createChart(
-            container,
+            element,
             {
                 width:
-                    container.clientWidth,
+                    element.clientWidth,
 
-                height: 260,
+                height: 270,
 
                 layout: {
                     background: {
@@ -844,9 +745,7 @@ function createChart(
 
                 timeScale: {
                     borderColor: "#263b61",
-
                     timeVisible: true,
-
                     secondsVisible: false
                 }
             }
@@ -857,42 +756,43 @@ function createChart(
         chart.addCandlestickSeries({
 
             upColor: "#00d68f",
-
             downColor: "#ff4f70",
 
             borderUpColor: "#00d68f",
-
             borderDownColor: "#ff4f70",
 
             wickUpColor: "#00d68f",
-
             wickDownColor: "#ff4f70"
 
         });
 
 
-    const formatted =
-        candles.map(c => {
+    const chartData = [];
 
-            const timestamp =
-                Math.floor(
-                    new Date(
-                        c.time.replace(" ", "T")
-                    ).getTime() / 1000
-                );
 
-            return {
-                time: timestamp,
-                open: c.open,
-                high: c.high,
-                low: c.low,
-                close: c.close
-            };
+    for (
+        let i = 0;
+        i < candles.length;
+        i++
+    ) {
+
+        const c = candles[i];
+
+        chartData.push({
+
+            time: candleTime(c.time),
+
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close
 
         });
 
+    }
 
-    series.setData(formatted);
+
+    series.setData(chartData);
 
 
     if (signal.demand) {
@@ -1011,18 +911,6 @@ function createChart(
 
     chart.timeScale().fitContent();
 
-
-    window.addEventListener(
-        "resize",
-        () => {
-
-            chart.applyOptions({
-                width:
-                    container.clientWidth
-            });
-
-        }
-    );
 }
 
 
@@ -1032,11 +920,12 @@ async function loadDashboard() {
 
         const response =
             await fetch(
-                "/api/signals",
+                "/api/dashboard",
                 {
                     cache: "no-store"
                 }
             );
+
 
         const data =
             await response.json();
@@ -1053,20 +942,27 @@ async function loadDashboard() {
                 "cards"
             );
 
+
         cards.innerHTML = "";
 
 
         for (
-            const signal of data.signals
+            let i = 0;
+            i < data.pairs.length;
+            i++
         ) {
 
+            const item =
+                data.pairs[i];
+
+            const signal =
+                item.signal;
+
             const chartId =
-                "chart-" +
-                signal.pair
-                    .replace("/", "-");
+                "chart" + i;
 
 
-            let extra = "";
+            let boxes = "";
 
 
             if (
@@ -1074,73 +970,78 @@ async function loadDashboard() {
                 signal.signal === "SELL"
             ) {
 
-                extra += makeBox(
+                boxes += box(
                     "ENTRY",
                     signal.entry,
                     "entry"
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "STOP LOSS",
                     signal.stop,
                     "stop"
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "TAKE PROFIT",
                     signal.tp,
                     "tp"
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "PROTECT 0.5R",
                     signal.protect,
                     "protect"
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "RSI",
                     signal.rsi,
                     "rsi"
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "RISK / REWARD",
-                    signal.rr
+                    signal.rr,
+                    ""
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "DEMAND",
-                    signal.demand
+                    signal.demand,
+                    ""
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "SUPPLY",
-                    signal.supply
+                    signal.supply,
+                    ""
                 );
 
             } else {
 
-                extra += makeBox(
+                boxes += box(
                     "CURRENT PRICE",
                     signal.price,
                     "entry"
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "RSI",
                     signal.rsi,
                     "rsi"
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "DEMAND",
-                    signal.demand
+                    signal.demand,
+                    ""
                 );
 
-                extra += makeBox(
+                boxes += box(
                     "SUPPLY",
-                    signal.supply
+                    signal.supply,
+                    ""
                 );
 
             }
@@ -1183,46 +1084,59 @@ async function loadDashboard() {
 
                     <div class="data">
 
-                        ${extra}
+                        ${boxes}
 
                     </div>
 
                 </div>
+
             `;
+
         }
 
 
         for (
-            const signal of data.signals
+            let i = 0;
+            i < data.pairs.length;
+            i++
         ) {
 
-            try {
-
-                const candles =
-                    await getCandles(
-                        signal.pair
-                    );
+            const item =
+                data.pairs[i];
 
 
-                if (
-                    Array.isArray(candles)
-                ) {
-
-                    const id =
-                        "chart-" +
-                        signal.pair
-                            .replace("/", "-");
+            const element =
+                document.getElementById(
+                    "chart" + i
+                );
 
 
-                    const container =
-                        document.getElementById(
-                            id
-                        );
+            drawChart(
+                element,
+                item.candles,
+                item.signal
+            );
+
+        }
 
 
-                    if (container) {
+    } catch (error) {
 
-                        createChart(
-                            container,
-                            candles,
-                           
+        console.log(error);
+
+
+        document.getElementById(
+            "cards"
+        ).innerHTML = `
+
+            <div class="card">
+
+                <div class="signal sell">
+                    CONNECTION ERROR
+                </div>
+
+                <div style="
+                    padding:20px;
+                    color:#9db0d2;
+                ">
+        
