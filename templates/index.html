@@ -190,6 +190,18 @@ header {
     color: #ffd83d;
 }
 
+.profit {
+    color: #00ff9d;
+}
+
+.loss {
+    color: #ff5475;
+}
+
+.lot {
+    color: #00eaff;
+}
+
 footer {
     text-align: center;
     padding: 25px;
@@ -522,6 +534,10 @@ async function load() {
                     ""
                 );
 
+                /*
+                 * TRADE INFORMATION
+                 */
+
                 if (
                     s.signal === "BUY" ||
                     s.signal === "SELL"
@@ -549,6 +565,34 @@ async function load() {
                         "PROTECT 0.5R",
                         s.protect,
                         "protect"
+                    );
+
+                    boxes += makeBox(
+                        "LOT SIZE",
+                        s.lot_size !== undefined
+                            ? s.lot_size
+                            : "0.01",
+                        "lot"
+                    );
+
+                    boxes += makeBox(
+                        "PROFIT AT TP",
+                        s.profit_at_tp !== undefined
+                            ? "$" + Number(
+                                s.profit_at_tp
+                              ).toFixed(2)
+                            : "-",
+                        "profit"
+                    );
+
+                    boxes += makeBox(
+                        "LOSS AT SL",
+                        s.loss_at_sl !== undefined
+                            ? "$" + Number(
+                                s.loss_at_sl
+                              ).toFixed(2)
+                            : "-",
+                        "loss"
                     );
 
                 }
@@ -636,4 +680,4 @@ setInterval(
 </script>
 
 </body>
-  </html>
+    </html>
