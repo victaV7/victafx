@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from datetime import datetime
 from flask import Flask, jsonify, render_template
@@ -31,6 +32,18 @@ LOT_SIZE = 0.01
 
 
 # =========================================================
+# DATA CACHE
+# =========================================================
+
+# Keep Twelve Data results temporarily so the website
+# does not repeatedly use API credits.
+
+CACHE_SECONDS = 60
+
+DATA_CACHE = {}
+
+
+# =========================================================
 # GET CANDLES FROM TWELVE DATA
 # =========================================================
 
@@ -39,6 +52,25 @@ def get_candles(symbol):
     if not API_KEY:
         print("ERROR: TWELVE_DATA_API_KEY is missing")
         return None
+
+    # -----------------------------------------------------
+    # USE CACHED DATA IF IT IS STILL FRESH
+    # -----------------------------------------------------
+
+    now = time.time()
+
+    if symbol in DATA_CACHE:
+
+        cached_time = DATA_CACHE[symbol]["time"]
+
+        if now - cached_time < CACHE_SECONDS:
+
+            return DATA_CACHE[symbol]["candles"]
+
+
+    # -----------------------------------------------------
+    # REQUEST NEW DATA
+    # -----------------------------------------------------
 
     url = "https://api.twelvedata.com/time_series"
 
@@ -64,6 +96,11 @@ def get_candles(symbol):
             print("Twelve Data error:")
             print(data)
 
+            # If API temporarily refuses the request,
+            # continue using the previous cached data.
+            if symbol in DATA_CACHE:
+                return DATA_CACHE[symbol]["candles"]
+
             return None
 
         values = list(
@@ -82,11 +119,24 @@ def get_candles(symbol):
                 "close": float(x["close"])
             })
 
+        # -------------------------------------------------
+        # SAVE DATA TO CACHE
+        # -------------------------------------------------
+
+        DATA_CACHE[symbol] = {
+            "time": now,
+            "candles": candles
+        }
+
         return candles
 
     except Exception as e:
 
         print("API error:", e)
+
+        # Use previous data if available
+        if symbol in DATA_CACHE:
+            return DATA_CACHE[symbol]["candles"]
 
         return None
 
