@@ -21,6 +21,9 @@ RSI_PERIOD = 14
 RR = 2.0
 PROTECT_R = 0.5
 
+# LOT SIZE
+LOT_SIZE = 0.01
+
 
 def get_candles(symbol):
 
@@ -37,18 +40,27 @@ def get_candles(symbol):
     }
 
     try:
-        r = requests.get(url, params=params, timeout=20)
+
+        r = requests.get(
+            url,
+            params=params,
+            timeout=20
+        )
+
         data = r.json()
 
         if "values" not in data:
             print("Twelve Data:", data)
             return None
 
-        values = list(reversed(data["values"]))
+        values = list(
+            reversed(data["values"])
+        )
 
         candles = []
 
         for x in values:
+
             candles.append({
                 "time": x["datetime"],
                 "open": float(x["open"]),
@@ -60,7 +72,9 @@ def get_candles(symbol):
         return candles
 
     except Exception as e:
+
         print("API error:", e)
+
         return None
 
 
@@ -73,22 +87,30 @@ def rsi(closes, period=14):
     losses = []
 
     for i in range(1, len(closes)):
+
         change = closes[i] - closes[i - 1]
 
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = (
+        sum(gains[:period]) / period
+    )
+
+    avg_loss = (
+        sum(losses[:period]) / period
+    )
 
     for i in range(period, len(gains)):
 
         avg_gain = (
-            avg_gain * (period - 1) + gains[i]
+            avg_gain * (period - 1)
+            + gains[i]
         ) / period
 
         avg_loss = (
-            avg_loss * (period - 1) + losses[i]
+            avg_loss * (period - 1)
+            + losses[i]
         ) / period
 
     if avg_loss == 0:
@@ -99,15 +121,68 @@ def rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def calculate_pnl(
+    pair,
+    risk,
+    current_price,
+    rr
+):
+
+    units = 100000 * LOT_SIZE
+
+    quote_currency = pair.split("/")[1]
+
+    # EUR/USD, GBP/USD, AUD/USD
+    if quote_currency == "USD":
+
+        loss_usd = risk * units
+
+        profit_usd = (
+            risk * rr * units
+        )
+
+    else:
+
+        loss_quote = risk * units
+
+        profit_quote = (
+            risk * rr * units
+        )
+
+        loss_usd = (
+            loss_quote / current_price
+        )
+
+        profit_usd = (
+            profit_quote / current_price
+        )
+
+    return {
+        "profit_at_tp": round(
+            profit_usd,
+            2
+        ),
+
+        "loss_at_sl": round(
+            loss_usd,
+            2
+        )
+    }
+
+
 def make_signal(pair, candles):
 
     if not candles or len(candles) < 30:
+
         return {
             "pair": pair,
             "signal": "NO DATA"
         }
 
-    closes = [x["close"] for x in candles]
+    closes = [
+        x["close"]
+        for x in candles
+    ]
 
     current = closes[-1]
 
@@ -119,62 +194,178 @@ def make_signal(pair, candles):
     recent = candles[-21:-1]
 
     demand = min(
-        x["low"] for x in recent
+        x["low"]
+        for x in recent
     )
 
     supply = max(
-        x["high"] for x in recent
+        x["high"]
+        for x in recent
     )
 
     result = {
+
         "pair": pair,
+
         "signal": "WAIT",
-        "price": round(current, 5),
-        "rsi": round(value_rsi, 2),
-        "demand": round(demand, 5),
-        "supply": round(supply, 5)
+
+        "price": round(
+            current,
+            5
+        ),
+
+        "rsi": round(
+            value_rsi,
+            2
+        ),
+
+        "demand": round(
+            demand,
+            5
+        ),
+
+        "supply": round(
+            supply,
+            5
+        ),
+
+        "lot_size": LOT_SIZE
     }
 
-    # BUY near demand + oversold RSI
-    if current <= demand * 1.002 and value_rsi <= 40:
+
+    # =========================
+    # BUY
+    # =========================
+
+    if (
+        current <= demand * 1.002
+        and value_rsi <= 40
+    ):
 
         entry = current
+
         stop = demand
+
         risk = entry - stop
 
         if risk > 0:
 
+            tp = (
+                entry
+                + risk * RR
+            )
+
+            protect = (
+                entry
+                + risk * PROTECT_R
+            )
+
+            pnl = calculate_pnl(
+                pair,
+                risk,
+                current,
+                RR
+            )
+
             result.update({
+
                 "signal": "BUY",
-                "entry": round(entry, 5),
-                "stop": round(stop, 5),
-                "tp": round(entry + risk * RR, 5),
-                "protect": round(
-                    entry + risk * PROTECT_R,
+
+                "entry": round(
+                    entry,
                     5
                 ),
-                "rr": "1:2"
+
+                "stop": round(
+                    stop,
+                    5
+                ),
+
+                "tp": round(
+                    tp,
+                    5
+                ),
+
+                "protect": round(
+                    protect,
+                    5
+                ),
+
+                "rr": "1:2",
+
+                "profit_at_tp":
+                    pnl["profit_at_tp"],
+
+                "loss_at_sl":
+                    pnl["loss_at_sl"]
             })
 
-    # SELL near supply + high RSI
-    elif current >= supply * 0.998 and value_rsi >= 60:
+
+    # =========================
+    # SELL
+    # =========================
+
+    elif (
+        current >= supply * 0.998
+        and value_rsi >= 60
+    ):
 
         entry = current
+
         stop = supply
+
         risk = stop - entry
 
         if risk > 0:
 
+            tp = (
+                entry
+                - risk * RR
+            )
+
+            protect = (
+                entry
+                - risk * PROTECT_R
+            )
+
+            pnl = calculate_pnl(
+                pair,
+                risk,
+                current,
+                RR
+            )
+
             result.update({
+
                 "signal": "SELL",
-                "entry": round(entry, 5),
-                "stop": round(stop, 5),
-                "tp": round(entry - risk * RR, 5),
-                "protect": round(
-                    entry - risk * PROTECT_R,
+
+                "entry": round(
+                    entry,
                     5
                 ),
-                "rr": "1:2"
+
+                "stop": round(
+                    stop,
+                    5
+                ),
+
+                "tp": round(
+                    tp,
+                    5
+                ),
+
+                "protect": round(
+                    protect,
+                    5
+                ),
+
+                "rr": "1:2",
+
+                "profit_at_tp":
+                    pnl["profit_at_tp"],
+
+                "loss_at_sl":
+                    pnl["loss_at_sl"]
             })
 
     return result
@@ -182,7 +373,10 @@ def make_signal(pair, candles):
 
 @app.route("/")
 def home():
-    return render_template("index.html")
+
+    return render_template(
+        "index.html"
+    )
 
 
 @app.route("/api/dashboard")
@@ -200,16 +394,25 @@ def dashboard():
         )
 
         output.append({
+
             "signal": signal,
+
             "candles": candles or []
+
         })
 
     return jsonify({
+
         "status": "ONLINE",
+
         "timeframe": INTERVAL,
+
+        "lot_size": LOT_SIZE,
+
         "updated": datetime.utcnow().strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         ),
+
         "pairs": output
     })
 
@@ -217,10 +420,6 @@ def dashboard():
 if __name__ == "__main__":
 
     port = int(
-        os.environ.get("PORT", 10000)
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-)
+        os.environ.get(
+            "PORT",
+            10000
