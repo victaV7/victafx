@@ -5,6 +5,10 @@ from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
+# =========================================================
+# SETTINGS
+# =========================================================
+
 API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 PAIRS = [
@@ -18,6 +22,7 @@ PAIRS = [
 INTERVAL = "5min"
 OUTPUT_SIZE = 100
 RSI_PERIOD = 14
+
 RR = 2.0
 PROTECT_R = 0.5
 
@@ -25,9 +30,14 @@ PROTECT_R = 0.5
 LOT_SIZE = 0.01
 
 
+# =========================================================
+# GET CANDLES FROM TWELVE DATA
+# =========================================================
+
 def get_candles(symbol):
 
     if not API_KEY:
+        print("ERROR: TWELVE_DATA_API_KEY is missing")
         return None
 
     url = "https://api.twelvedata.com/time_series"
@@ -41,16 +51,19 @@ def get_candles(symbol):
 
     try:
 
-        r = requests.get(
+        response = requests.get(
             url,
             params=params,
             timeout=20
         )
 
-        data = r.json()
+        data = response.json()
 
         if "values" not in data:
-            print("Twelve Data:", data)
+
+            print("Twelve Data error:")
+            print(data)
+
             return None
 
         values = list(
@@ -78,6 +91,10 @@ def get_candles(symbol):
         return None
 
 
+# =========================================================
+# RSI
+# =========================================================
+
 def rsi(closes, period=14):
 
     if len(closes) < period + 1:
@@ -90,8 +107,13 @@ def rsi(closes, period=14):
 
         change = closes[i] - closes[i - 1]
 
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+        gains.append(
+            max(change, 0)
+        )
+
+        losses.append(
+            max(-change, 0)
+        )
 
     avg_gain = (
         sum(gains[:period]) / period
@@ -118,8 +140,14 @@ def rsi(closes, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100 - (100 / (1 + rs))
+    return 100 - (
+        100 / (1 + rs)
+    )
 
+
+# =========================================================
+# PROFIT / LOSS
+# =========================================================
 
 def calculate_pnl(
     pair,
@@ -132,7 +160,11 @@ def calculate_pnl(
 
     quote_currency = pair.split("/")[1]
 
-    # EUR/USD, GBP/USD, AUD/USD
+    # Pairs quoted in USD
+    # EUR/USD
+    # GBP/USD
+    # AUD/USD
+
     if quote_currency == "USD":
 
         loss_usd = risk * units
@@ -142,6 +174,9 @@ def calculate_pnl(
         )
 
     else:
+
+        # USD/JPY
+        # USD/CAD
 
         loss_quote = risk * units
 
@@ -162,13 +197,16 @@ def calculate_pnl(
             profit_usd,
             2
         ),
-
         "loss_at_sl": round(
             loss_usd,
             2
         )
     }
 
+
+# =========================================================
+# MAKE SIGNAL
+# =========================================================
 
 def make_signal(pair, candles):
 
@@ -180,8 +218,8 @@ def make_signal(pair, candles):
         }
 
     closes = [
-        x["close"]
-        for x in candles
+        candle["close"]
+        for candle in candles
     ]
 
     current = closes[-1]
@@ -191,16 +229,24 @@ def make_signal(pair, candles):
         RSI_PERIOD
     )
 
+    if value_rsi is None:
+
+        return {
+            "pair": pair,
+            "signal": "NO DATA"
+        }
+
+    # Last 20 completed candles
     recent = candles[-21:-1]
 
     demand = min(
-        x["low"]
-        for x in recent
+        candle["low"]
+        for candle in recent
     )
 
     supply = max(
-        x["high"]
-        for x in recent
+        candle["high"]
+        for candle in recent
     )
 
     result = {
@@ -233,9 +279,9 @@ def make_signal(pair, candles):
     }
 
 
-    # =========================
-    # BUY
-    # =========================
+    # =====================================================
+    # BUY SIGNAL
+    # =====================================================
 
     if (
         current <= demand * 1.002
@@ -293,17 +339,19 @@ def make_signal(pair, candles):
 
                 "rr": "1:2",
 
-                "profit_at_tp":
-                    pnl["profit_at_tp"],
+                "profit_at_tp": pnl[
+                    "profit_at_tp"
+                ],
 
-                "loss_at_sl":
-                    pnl["loss_at_sl"]
+                "loss_at_sl": pnl[
+                    "loss_at_sl"
+                ]
             })
 
 
-    # =========================
-    # SELL
-    # =========================
+    # =====================================================
+    # SELL SIGNAL
+    # =====================================================
 
     elif (
         current >= supply * 0.998
@@ -361,15 +409,21 @@ def make_signal(pair, candles):
 
                 "rr": "1:2",
 
-                "profit_at_tp":
-                    pnl["profit_at_tp"],
+                "profit_at_tp": pnl[
+                    "profit_at_tp"
+                ],
 
-                "loss_at_sl":
-                    pnl["loss_at_sl"]
+                "loss_at_sl": pnl[
+                    "loss_at_sl"
+                ]
             })
 
     return result
 
+
+# =========================================================
+# HOME PAGE
+# =========================================================
 
 @app.route("/")
 def home():
@@ -379,6 +433,10 @@ def home():
     )
 
 
+# =========================================================
+# DASHBOARD API
+# =========================================================
+
 @app.route("/api/dashboard")
 def dashboard():
 
@@ -386,7 +444,9 @@ def dashboard():
 
     for pair in PAIRS:
 
-        candles = get_candles(pair)
+        candles = get_candles(
+            pair
+        )
 
         signal = make_signal(
             pair,
@@ -417,9 +477,20 @@ def dashboard():
     })
 
 
+# =========================================================
+# START SERVER
+# =========================================================
+
 if __name__ == "__main__":
 
     port = int(
         os.environ.get(
             "PORT",
             10000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
