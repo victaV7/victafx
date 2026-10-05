@@ -8,8 +8,7 @@ from flask import Flask, jsonify, render_template
 app = Flask(__name__)
 
 # =========================================================
-# VIC FX SIGNALS
-# BIG MOVE INTRADAY
+# VIC FX SIGNALS - BIG MOVE INTRADAY
 # =========================================================
 
 API_KEY = os.getenv("TWELVE_DATA_API_KEY")
@@ -19,12 +18,12 @@ PAIRS = [
     "GBP/USD",
     "USD/JPY",
     "AUD/USD",
-    "USD/CAD"
+    "USD/CAD",
 ]
 
-# ---------------------------------------------------------
+# =========================================================
 # TIMEFRAMES
-# ---------------------------------------------------------
+# =========================================================
 
 TIMEFRAMES = {
     "MONTHLY": "1month",
@@ -33,77 +32,78 @@ TIMEFRAMES = {
     "4H": "4h",
     "1H": "1h",
     "15M": "15min",
-    "5M": "5min"
+    "5M": "5min",
 }
 
-# ---------------------------------------------------------
-# STRATEGY SETTINGS
-# ---------------------------------------------------------
-
-RSI_PERIOD = 14
-
-RR = 2.0
-
-# Your existing protection rule
-PROTECT_R = 0.5
-
-# Do not scalp
-MIN_SIGNAL_SCORE = 7
-
-# Supply / demand settings
-ZONE_LOOKBACK = 40
-ZONE_ATR_MULTIPLIER = 1.5
-
-# Trend settings
-FAST_EMA = 20
-SLOW_EMA = 50
-
-# ATR
-ATR_PERIOD = 14
-
-# Number of candles requested
-OUTPUT_SIZES = {
+OUTPUT_SIZE = {
     "1month": 80,
     "1week": 120,
     "1day": 180,
     "4h": 250,
     "1h": 250,
     "15min": 250,
-    "5min": 250
+    "5min": 250,
 }
 
-# Prevent repeated alerts for same setup
-last_signals = {}
+# =========================================================
+# STRATEGY SETTINGS
+# =========================================================
 
-# Cache market data so the website is not constantly hitting API
+RSI_PERIOD = 14
+
+FAST_EMA = 20
+SLOW_EMA = 50
+ATR_PERIOD = 14
+
+# Your 1:2 RR
+RR = 2.0
+
+# Your 0.5R protection
+PROTECT_R = 0.5
+
+ZONE_LOOKBACK = 40
+
+# Minimum quality score for BIG MOVE signal
+MIN_SIGNAL_SCORE = 7
+
+# API cache
+CACHE_SECONDS = 45
+
 data_cache = {}
 
-CACHE_SECONDS = 45
+latest_market = {
+    "status": "starting",
+    "signals": [],
+}
+
+last_signals = {}
 
 
 # =========================================================
-# BASIC HELPERS
+# LOGGING
 # =========================================================
 
 def log(message):
+    now = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
     print(
-        f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC] "
-        f"{message}",
+        f"[{now} UTC] {message}",
         flush=True
     )
 
 
-def safe_float(value):
-    try:
-        return float(value)
-    except:
-        return None
+# =========================================================
+# PRICE ROUNDING
+# =========================================================
 
+def round_price(pair, price):
 
-def pip_size(pair):
     if "JPY" in pair:
-        return 0.01
-    return 0.0001
+        return round(price, 3)
+
+    return round(price, 5)
 
 
 # =========================================================
@@ -111,20 +111,17 @@ def pip_size(pair):
 # =========================================================
 
 def get_batch_data(interval, outputsize):
-    """
-    Fetch all five pairs for one timeframe.
-
-    Twelve Data supports comma-separated symbols in a batch
-    time-series request.
-    """
 
     if not API_KEY:
         return {}
 
-    cache_key = f"{interval}_{outputsize}"
+    cache_key = f"{interval}:{outputsize}"
 
-    if cache_key in data_cache:
-        saved_time, saved_data = data_cache[cache_key]
+    cached = data_cache.get(cache_key)
+
+    if cached:
+
+        saved_time, saved_data = cached
 
         if time.time() - saved_time < CACHE_SECONDS:
             return saved_data
@@ -137,10 +134,11 @@ def get_batch_data(interval, outputsize):
         "outputsize": outputsize,
         "apikey": API_KEY,
         "order": "asc",
-        "timezone": "UTC"
+        "timezone": "UTC",
     }
 
     try:
+
         response = requests.get(
             url,
             params=params,
@@ -151,80 +149,109 @@ def get_batch_data(interval, outputsize):
 
         raw = response.json()
 
-        # -------------------------------------------------
-        # Twelve Data can return:
-        # {"EUR/USD": {...}, "GBP/USD": {...}}
-        # -------------------------------------------------
+    except Exception as exc:
 
-        result = {}
-
-        if isinstance(raw, dict):
-
-            for pair in PAIRS:
-
-                pair_data = raw.get(pair)
-
-                if not pair_data:
-                    continue
-
-                if not isinstance(pair_data, dict):
-                    continue
-
-                if "values" not in pair_data:
-                    continue
-
-                candles = []
-
-                for item in pair_data["values"]:
-
-                    try:
-                        candles.append({
-                            "datetime": item.get("datetime"),
-                            "open": float(item["open"]),
-                            "high": float(item["high"]),
-                            "low": float(item["low"]),
-                            "close": float(item["close"])
-                        })
-                    except:
-                        continue
-
-                if candles:
-                    result[pair] = candles
-
-        data_cache[cache_key] = (
-            time.time(),
-            result
+        log(
+            f"DATA ERROR {interval}: {exc}"
         )
 
-        return result
-
-    except Exception as e:
-        log(f"DATA ERROR {interval}: {e}")
         return {}
 
+    result = {}
+
+    if not isinstance(raw, dict):
+        return result
+
+    for pair in PAIRS:
+
+        item = raw.get(pair)
+
+        if not isinstance(item, dict):
+            continue
+
+        values = item.get(
+            "values",
+            []
+        )
+
+        candles = []
+
+        for row in values:
+
+            try:
+
+                candles.append({
+                    "datetime": row.get(
+                        "datetime"
+                    ),
+                    "open": float(
+                        row["open"]
+                    ),
+                    "high": float(
+                        row["high"]
+                    ),
+                    "low": float(
+                        row["low"]
+                    ),
+                    "close": float(
+                        row["close"]
+                    ),
+                })
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError
+            ):
+
+                continue
+
+        if candles:
+            result[pair] = candles
+
+    data_cache[cache_key] = (
+        time.time(),
+        result
+    )
+
+    return result
+
 
 # =========================================================
-# INDICATORS
+# EMA
 # =========================================================
 
-def calculate_ema(values, period):
+def ema(values, period):
 
     if len(values) < period:
         return None
 
-    multiplier = 2 / (period + 1)
+    value = sum(
+        values[:period]
+    ) / period
 
-    ema = sum(values[:period]) / period
+    multiplier = 2.0 / (
+        period + 1
+    )
 
     for price in values[period:]:
-        ema = (
-            (price - ema) * multiplier
-        ) + ema
 
-    return ema
+        value = (
+            (price - value)
+            * multiplier
+        ) + value
+
+    return value
 
 
-def calculate_rsi(closes, period=14):
+# =========================================================
+# RSI
+# =========================================================
+
+def rsi(
+    closes,
+    period=RSI_PERIOD
+):
 
     if len(closes) < period + 1:
         return None
@@ -232,75 +259,123 @@ def calculate_rsi(closes, period=14):
     gains = []
     losses = []
 
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i - 1]
+    for i in range(
+        1,
+        len(closes)
+    ):
 
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
+        change = (
+            closes[i]
+            - closes[i - 1]
+        )
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+        gains.append(
+            max(change, 0.0)
+        )
 
-    for i in range(period, len(gains)):
+        losses.append(
+            max(-change, 0.0)
+        )
+
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
+
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
+
+    for i in range(
+        period,
+        len(gains)
+    ):
 
         avg_gain = (
-            (avg_gain * (period - 1)) + gains[i]
+            (
+                avg_gain
+                * (period - 1)
+            )
+            + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1)) + losses[i]
+            (
+                avg_loss
+                * (period - 1)
+            )
+            + losses[i]
         ) / period
 
     if avg_loss == 0:
-        return 100
+        return 100.0
 
-    rs = avg_gain / avg_loss
+    rs_value = (
+        avg_gain
+        / avg_loss
+    )
 
-    return 100 - (100 / (1 + rs))
+    return (
+        100.0
+        - (
+            100.0
+            / (1.0 + rs_value)
+        )
+    )
 
 
-def calculate_atr(candles, period=14):
+# =========================================================
+# ATR
+# =========================================================
+
+def atr(
+    candles,
+    period=ATR_PERIOD
+):
 
     if len(candles) < period + 1:
         return None
 
-    true_ranges = []
+    ranges = []
 
-    for i in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles)
+    ):
 
         current = candles[i]
         previous = candles[i - 1]
 
-        tr1 = current["high"] - current["low"]
-
-        tr2 = abs(
-            current["high"] - previous["close"]
-        )
-
-        tr3 = abs(
-            current["low"] - previous["close"]
-        )
-
         true_range = max(
-            tr1,
-            tr2,
-            tr3
+            current["high"]
+            - current["low"],
+
+            abs(
+                current["high"]
+                - previous["close"]
+            ),
+
+            abs(
+                current["low"]
+                - previous["close"]
+            )
         )
 
-        true_ranges.append(true_range)
+        ranges.append(
+            true_range
+        )
 
-    if len(true_ranges) < period:
+    if len(ranges) < period:
         return None
 
-    return sum(true_ranges[-period:]) / period
+    return sum(
+        ranges[-period:]
+    ) / period
 
 
 # =========================================================
-# MARKET STRUCTURE
+# BULLISH STRUCTURE
 # =========================================================
 
 def bullish_structure(candles):
@@ -310,23 +385,39 @@ def bullish_structure(candles):
 
     recent = candles[-20:]
 
-    highs = [x["high"] for x in recent]
-    lows = [x["low"] for x in recent]
+    first = recent[:10]
+    second = recent[10:]
 
-    midpoint = len(recent) // 2
-
-    first_half_high = max(highs[:midpoint])
-    second_half_high = max(highs[midpoint:])
-
-    first_half_low = min(lows[:midpoint])
-    second_half_low = min(lows[midpoint:])
-
-    return (
-        second_half_high > first_half_high
-        and
-        second_half_low > first_half_low
+    first_high = max(
+        x["high"]
+        for x in first
     )
 
+    second_high = max(
+        x["high"]
+        for x in second
+    )
+
+    first_low = min(
+        x["low"]
+        for x in first
+    )
+
+    second_low = min(
+        x["low"]
+        for x in second
+    )
+
+    return (
+        second_high > first_high
+        and
+        second_low > first_low
+    )
+
+
+# =========================================================
+# BEARISH STRUCTURE
+# =========================================================
 
 def bearish_structure(candles):
 
@@ -335,141 +426,46 @@ def bearish_structure(candles):
 
     recent = candles[-20:]
 
-    highs = [x["high"] for x in recent]
-    lows = [x["low"] for x in recent]
+    first = recent[:10]
+    second = recent[10:]
 
-    midpoint = len(recent) // 2
+    first_high = max(
+        x["high"]
+        for x in first
+    )
 
-    first_half_high = max(highs[:midpoint])
-    second_half_high = max(highs[midpoint:])
+    second_high = max(
+        x["high"]
+        for x in second
+    )
 
-    first_half_low = min(lows[:midpoint])
-    second_half_low = min(lows[midpoint:])
+    first_low = min(
+        x["low"]
+        for x in first
+    )
+
+    second_low = min(
+        x["low"]
+        for x in second
+    )
 
     return (
-        second_half_high < first_half_high
+        second_high < first_high
         and
-        second_half_low < first_half_low
+        second_low < first_low
     )
 
 
 # =========================================================
-# SUPPLY / DEMAND
-# =========================================================
-
-def find_demand_zone(candles):
-
-    if len(candles) < ZONE_LOOKBACK:
-        return None
-
-    atr = calculate_atr(candles, ATR_PERIOD)
-
-    if not atr:
-        return None
-
-    recent = candles[-ZONE_LOOKBACK:]
-
-    # Find a strong bearish candle followed by bullish movement.
-    for i in range(len(recent) - 5, 1, -1):
-
-        candle = recent[i]
-
-        body = abs(
-            candle["close"] - candle["open"]
-        )
-
-        if body > atr * ZONE_ATR_MULTIPLIER:
-
-            if candle["close"] < candle["open"]:
-
-                following = recent[i + 1:i + 4]
-
-                if following:
-
-                    bullish_move = (
-                        max(x["close"] for x in following)
-                        - candle["low"]
-                    )
-
-                    if bullish_move > atr * 0.8:
-
-                        return {
-                            "low": candle["low"],
-                            "high": max(
-                                candle["open"],
-                                candle["close"]
-                            )
-                        }
-
-    return None
-
-
-def find_supply_zone(candles):
-
-    if len(candles) < ZONE_LOOKBACK:
-        return None
-
-    atr = calculate_atr(candles, ATR_PERIOD)
-
-    if not atr:
-        return None
-
-    recent = candles[-ZONE_LOOKBACK:]
-
-    for i in range(len(recent) - 5, 1, -1):
-
-        candle = recent[i]
-
-        body = abs(
-            candle["close"] - candle["open"]
-        )
-
-        if body > atr * ZONE_ATR_MULTIPLIER:
-
-            if candle["close"] > candle["open"]:
-
-                following = recent[i + 1:i + 4]
-
-                if following:
-
-                    bearish_move = (
-                        candle["high"]
-                        - min(
-                            x["close"]
-                            for x in following
-                        )
-                    )
-
-                    if bearish_move > atr * 0.8:
-
-                        return {
-                            "low": min(
-                                candle["open"],
-                                candle["close"]
-                            ),
-                            "high": candle["high"]
-                        }
-
-    return None
-
-
-def price_inside_zone(price, zone):
-
-    if not zone:
-        return False
-
-    return (
-        zone["low"] <= price <= zone["high"]
-    )
-
-
-# =========================================================
-# HIGHER TIMEFRAME BIAS
+# TIMEFRAME DIRECTION
 # =========================================================
 
 def timeframe_direction(candles):
 
-    if len(candles) < SLOW_EMA + 5:
+    if len(candles) < (
+        SLOW_EMA + 5
+    ):
+
         return "NEUTRAL"
 
     closes = [
@@ -477,168 +473,259 @@ def timeframe_direction(candles):
         for x in candles
     ]
 
-    fast = calculate_ema(
+    fast = ema(
         closes,
         FAST_EMA
     )
 
-    slow = calculate_ema(
+    slow = ema(
         closes,
         SLOW_EMA
     )
 
-    if fast is None or slow is None:
-        return "NEUTRAL"
-
     price = closes[-1]
 
-    bull_structure = bullish_structure(candles)
-    bear_structure = bearish_structure(candles)
+    if (
+        fast is None
+        or slow is None
+    ):
+
+        return "NEUTRAL"
 
     if (
         fast > slow
         and price > fast
-        and bull_structure
+        and bullish_structure(candles)
     ):
+
         return "BULLISH"
 
     if (
         fast < slow
         and price < fast
-        and bear_structure
+        and bearish_structure(candles)
     ):
+
         return "BEARISH"
 
     return "NEUTRAL"
 
 
-def get_top_down_bias(pair_data):
+# =========================================================
+# DEMAND ZONE
+# =========================================================
 
-    directions = {}
+def find_demand_zone(candles):
 
-    for name in [
-        "MONTHLY",
-        "WEEKLY",
-        "DAILY",
-        "4H"
-    ]:
+    if len(candles) < (
+        ZONE_LOOKBACK
+    ):
 
-        candles = pair_data.get(name, [])
+        return None
 
-        directions[name] = timeframe_direction(
-            candles
+    current_atr = atr(candles)
+
+    if not current_atr:
+        return None
+
+    recent = candles[
+        -ZONE_LOOKBACK:
+    ]
+
+    for i in range(
+        len(recent) - 4,
+        0,
+        -1
+    ):
+
+        candle = recent[i]
+
+        body = abs(
+            candle["close"]
+            - candle["open"]
         )
 
-    bullish = sum(
-        1
-        for x in directions.values()
-        if x == "BULLISH"
-    )
+        if body < (
+            current_atr * 0.8
+        ):
 
-    bearish = sum(
-        1
-        for x in directions.values()
-        if x == "BEARISH"
-    )
+            continue
 
-    if bullish >= 3:
-        final_bias = "BULLISH"
+        if (
+            candle["close"]
+            >= candle["open"]
+        ):
 
-    elif bearish >= 3:
-        final_bias = "BEARISH"
+            continue
 
-    else:
-        final_bias = "NEUTRAL"
+        following = recent[
+            i + 1:i + 4
+        ]
 
-    return final_bias, directions
+        if not following:
+            continue
+
+        move = (
+            max(
+                x["close"]
+                for x in following
+            )
+            - candle["low"]
+        )
+
+        if move >= (
+            current_atr * 0.8
+        ):
+
+            return {
+                "low": candle["low"],
+                "high": max(
+                    candle["open"],
+                    candle["close"]
+                ),
+            }
+
+    return None
 
 
 # =========================================================
-# 1H ACTIONABLE STRUCTURE
+# SUPPLY ZONE
 # =========================================================
 
-def actionable_1h(pair_data, bias):
+def find_supply_zone(candles):
 
-    candles = pair_data.get("1H", [])
+    if len(candles) < (
+        ZONE_LOOKBACK
+    ):
 
-    if len(candles) < 60:
-        return False
+        return None
 
-    if bias == "BULLISH":
-        return bullish_structure(candles)
+    current_atr = atr(candles)
 
-    if bias == "BEARISH":
-        return bearish_structure(candles)
+    if not current_atr:
+        return None
 
-    return False
+    recent = candles[
+        -ZONE_LOOKBACK:
+    ]
+
+    for i in range(
+        len(recent) - 4,
+        0,
+        -1
+    ):
+
+        candle = recent[i]
+
+        body = abs(
+            candle["close"]
+            - candle["open"]
+        )
+
+        if body < (
+            current_atr * 0.8
+        ):
+
+            continue
+
+        if (
+            candle["close"]
+            <= candle["open"]
+        ):
+
+            continue
+
+        following = recent[
+            i + 1:i + 4
+        ]
+
+        if not following:
+            continue
+
+        move = (
+            candle["high"]
+            - min(
+                x["close"]
+                for x in following
+            )
+        )
+
+        if move >= (
+            current_atr * 0.8
+        ):
+
+            return {
+                "low": min(
+                    candle["open"],
+                    candle["close"]
+                ),
+                "high": candle["high"],
+            }
+
+    return None
 
 
 # =========================================================
-# 15M CONFIRMATION
+# 15 MINUTE CONFIRMATION
 # =========================================================
 
-def fifteen_minute_confirmation(pair_data, bias):
-
-    candles = pair_data.get("15M", [])
+def fifteen_minute_confirmation(
+    candles,
+    bias
+):
 
     if len(candles) < 50:
         return False
 
-    closes = [
+    value = rsi([
         x["close"]
         for x in candles
-    ]
+    ])
 
-    rsi = calculate_rsi(
-        closes,
-        RSI_PERIOD
-    )
-
-    if rsi is None:
+    if value is None:
         return False
 
     if bias == "BULLISH":
 
-        # RSI is not required to be deeply oversold.
-        # We want momentum to recover without buying
-        # an extreme spike.
-
-        return 45 <= rsi <= 68
+        return (
+            45 <= value <= 68
+        )
 
     if bias == "BEARISH":
 
-        return 32 <= rsi <= 55
+        return (
+            32 <= value <= 55
+        )
 
     return False
 
 
 # =========================================================
-# 5M ENTRY
+# 5 MINUTE ENTRY
 # =========================================================
 
-def five_minute_signal(pair_data, bias):
-
-    candles = pair_data.get("5M", [])
+def five_minute_entry(
+    candles,
+    bias
+):
 
     if len(candles) < 60:
         return None
 
-    closes = [
+    value = rsi([
         x["close"]
         for x in candles
-    ]
+    ])
 
-    rsi = calculate_rsi(
-        closes,
-        RSI_PERIOD
+    current_atr = atr(
+        candles
     )
 
-    atr = calculate_atr(
-        candles,
-        ATR_PERIOD
-    )
+    if (
+        value is None
+        or current_atr is None
+    ):
 
-    if rsi is None or atr is None:
         return None
 
     current = candles[-1]
@@ -650,34 +737,30 @@ def five_minute_signal(pair_data, bias):
 
     if bias == "BULLISH":
 
-        bullish_candle = (
-            current["close"] > current["open"]
-        )
-
-        previous_bearish = (
-            previous["close"] < previous["open"]
-        )
-
-        momentum = (
-            current["close"] > previous["high"]
-        )
-
-        rsi_ok = (
-            50 <= rsi <= 70
-        )
-
         if (
-            bullish_candle
-            and previous_bearish
-            and momentum
-            and rsi_ok
+            current["close"]
+            > current["open"]
+
+            and
+
+            previous["close"]
+            < previous["open"]
+
+            and
+
+            current["close"]
+            > previous["high"]
+
+            and
+
+            50 <= value <= 70
         ):
 
             return {
                 "direction": "BUY",
-                "price": current["close"],
-                "atr": atr,
-                "rsi": rsi
+                "entry": current["close"],
+                "atr": current_atr,
+                "rsi": value,
             }
 
     # -----------------------------------------------------
@@ -686,300 +769,71 @@ def five_minute_signal(pair_data, bias):
 
     if bias == "BEARISH":
 
-        bearish_candle = (
-            current["close"] < current["open"]
-        )
-
-        previous_bullish = (
-            previous["close"] > previous["open"]
-        )
-
-        momentum = (
-            current["close"] < previous["low"]
-        )
-
-        rsi_ok = (
-            30 <= rsi <= 50
-        )
-
         if (
-            bearish_candle
-            and previous_bullish
-            and momentum
-            and rsi_ok
+            current["close"]
+            < current["open"]
+
+            and
+
+            previous["close"]
+            > previous["open"]
+
+            and
+
+            current["close"]
+            < previous["low"]
+
+            and
+
+            30 <= value <= 50
         ):
 
             return {
                 "direction": "SELL",
-                "price": current["close"],
-                "atr": atr,
-                "rsi": rsi
+                "entry": current["close"],
+                "atr": current_atr,
+                "rsi": value,
             }
 
     return None
 
 
 # =========================================================
-# BUILD TRADE
+# TOP-DOWN BIAS
 # =========================================================
 
-def build_trade(pair, pair_data, entry_signal):
-
-    direction = entry_signal["direction"]
-
-    entry = entry_signal["price"]
-
-    atr = entry_signal["atr"]
-
-    # Use 5M ATR for a realistic intraday stop.
-    stop_distance = atr * 1.5
-
-    # Avoid an unrealistically tiny stop.
-    minimum_distance = pip_size(pair) * 15
-
-    stop_distance = max(
-        stop_distance,
-        minimum_distance
-    )
-
-    if direction == "BUY":
-
-        sl = entry - stop_distance
-
-        tp = entry + (
-            stop_distance * RR
-        )
-
-    else:
-
-        sl = entry + stop_distance
-
-        tp = entry - (
-            stop_distance * RR
-        )
-
-    return {
-        "pair": pair,
-        "direction": direction,
-        "entry": round_price(pair, entry),
-        "stop_loss": round_price(pair, sl),
-        "take_profit": round_price(pair, tp),
-        "risk_distance": round_price(
-            pair,
-            stop_distance
-        ),
-        "rr": RR,
-        "protect_at_r": PROTECT_R,
-        "rsi_5m": round(
-            entry_signal["rsi"],
-            2
-        )
-    }
-
-
-def round_price(pair, price):
-
-    if "JPY" in pair:
-        return round(price, 3)
-
-    return round(price, 5)
-
-
-# =========================================================
-# SIGNAL SCORE
-# =========================================================
-
-def calculate_score(
-    pair_data,
-    bias,
-    directions,
-    trade
+def top_down_bias(
+    pair_data
 ):
 
-    score = 0
-    reasons = []
+    directions = {}
 
-    # -----------------------------------------------------
-    # Higher timeframe alignment
-    # -----------------------------------------------------
-
-    if bias in ["BULLISH", "BEARISH"]:
-
-        score += 2
-        reasons.append(
-            "Higher-timeframe bias confirmed"
-        )
-
-    # Weekly
-    if directions.get("WEEKLY") == bias:
-
-        score += 1
-        reasons.append(
-            "Weekly agrees"
-        )
-
-    # Daily
-    if directions.get("DAILY") == bias:
-
-        score += 1
-        reasons.append(
-            "Daily agrees"
-        )
-
-    # 4H
-    if directions.get("4H") == bias:
-
-        score += 1
-        reasons.append(
-            "4H agrees"
-        )
-
-    # 1H structure
-    if actionable_1h(
-        pair_data,
-        bias
+    for name in (
+        "MONTHLY",
+        "WEEKLY",
+        "DAILY",
+        "4H"
     ):
 
-        score += 1
-        reasons.append(
-            "1H structure confirmed"
+        directions[name] = (
+            timeframe_direction(
+                pair_data.get(
+                    name,
+                    []
+                )
+            )
         )
 
-    # 15M
-    if fifteen_minute_confirmation(
-        pair_data,
-        bias
-    ):
-
-        score += 1
-        reasons.append(
-            "15M confirmation"
-        )
-
-    # 5M entry
-    score += 1
-
-    reasons.append(
-        "5M entry confirmed"
+    bullish_count = sum(
+        value == "BULLISH"
+        for value in directions.values()
     )
 
-    # RSI
-    if 40 <= trade["rsi_5m"] <= 70:
-
-        score += 1
-        reasons.append(
-            "RSI supports momentum"
-        )
-
-    return score, reasons
-
-
-# =========================================================
-# ANALYZE PAIR
-# =========================================================
-
-def analyze_pair(pair, all_data):
-
-    pair_data = {}
-
-    for timeframe_name, interval in TIMEFRAMES.items():
-
-        timeframe_data = all_data.get(
-            interval,
-            {}
-        )
-
-        pair_data[timeframe_name] = (
-            timeframe_data.get(pair, [])
-        )
-
-    # Need enough 5M data
-    if len(pair_data["5M"]) < 60:
-        return {
-            "pair": pair,
-            "signal": "WAIT",
-            "reason": "Not enough 5M data"
-        }
-
-    bias, directions = get_top_down_bias(
-        pair_data
+    bearish_count = sum(
+        value == "BEARISH"
+        for value in directions.values()
     )
 
-    if bias == "NEUTRAL":
+    if bullish_count >= 3:
 
-        return {
-            "pair": pair,
-            "signal": "WAIT",
-            "bias": bias,
-            "timeframes": directions,
-            "reason": "Higher timeframes not aligned"
-        }
-
-    # -----------------------------------------------------
-    # 1H
-    # -----------------------------------------------------
-
-    if not actionable_1h(
-        pair_data,
-        bias
-    ):
-
-        return {
-            "pair": pair,
-            "signal": "WAIT",
-            "bias": bias,
-            "timeframes": directions,
-            "reason": "1H structure not confirmed"
-        }
-
-    # -----------------------------------------------------
-    # 15M
-    # -----------------------------------------------------
-
-    if not fifteen_minute_confirmation(
-        pair_data,
-        bias
-    ):
-
-        return {
-            "pair": pair,
-            "signal": "WAIT",
-            "bias": bias,
-            "timeframes": directions,
-            "reason": "15M confirmation missing"
-        }
-
-    # -----------------------------------------------------
-    # Supply / Demand
-    # -----------------------------------------------------
-
-    if bias == "BULLISH":
-
-        zone = find_demand_zone(
-            pair_data["1H"]
-        )
-
-    else:
-
-        zone = find_supply_zone(
-            pair_data["1H"]
-        )
-
-    if not zone:
-
-        return {
-            "pair": pair,
-            "signal": "WAIT",
-            "bias": bias,
-            "timeframes": directions,
-            "reason": "No strong supply/demand zone"
-        }
-
-    current_price = pair_data["5M"][-1]["close"]
-
-    # Price should be reasonably close to the zone.
-    zone_distance = abs(
-        current_price
-        - (
-            (zone["low"] + zone["high"])
-         
+        bias = "BULL
