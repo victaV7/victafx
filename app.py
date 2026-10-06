@@ -1,3 +1,4 @@
+
 import os
 import time
 import threading
@@ -1210,10 +1211,4 @@ def analyze_pair(
             ],
         }
 
-    if score < MIN_SIGNAL_SCORE:
-
-        return {
-            "pair": pair,
-            "status": "WAIT",
-            "bias": bias,
-   
+    if sc
