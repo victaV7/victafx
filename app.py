@@ -603,14 +603,14 @@ def signals():
     })
 
 
+# Start market scanner on Render
+threading.Thread(
+    target=scanner,
+    daemon=True
+).start()
+
 if __name__ == "__main__":
-
-    threading.Thread(
-        target=scanner,
-        daemon=True
-    ).start()
-
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", "5000"))
-        )
+)
