@@ -7,261 +7,201 @@ from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
-# =========================================================
-# VIC FX SIGNALS - BIG MOVE INTRADAY
-# =========================================================
-
 API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 PAIRS = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "USD/CAD",
-    "AUD/USD",
-    "NZD/USD",
-    "EUR/GBP",
-    "EUR/JPY",
-    "GBP/JPY",
-    "AUD/JPY",
-    "NZD/JPY",
+    "EUR/USD","GBP/USD","USD/JPY","USD/CHF",
+    "USD/CAD","AUD/USD","NZD/USD","EUR/GBP",
+    "EUR/JPY","GBP/JPY","AUD/JPY","NZD/JPY"
 ]
 
-TIMEFRAMES = {
-    "MONTHLY": "1month",
-    "WEEKLY": "1week",
-    "DAILY": "1day",
-    "4H": "4h",
-    "1H": "1h",
-    "15M": "15min",
-    "5M": "5min",
-}
-
-OUTPUT_SIZE = {
-    "1month": 80,
-    "1week": 120,
-    "1day": 180,
-    "4h": 250,
-    "1h": 250,
-    "15min": 250,
-    "5min": 250,
-}
-
 RSI_PERIOD = 14
-FAST_EMA = 20
-SLOW_EMA = 50
-ATR_PERIOD = 14
 RR = 2.0
 PROTECT_R = 0.5
-ZONE_LOOKBACK = 40
-MIN_SIGNAL_SCORE = 7
-SL_ATR_MULTIPLIER = 1.0
-CACHE_SECONDS = 45
-SCAN_SECONDS = 60
+MIN_SCORE = 7
 
 cache = {}
-last_scan = 0.0
-scan_lock = threading.Lock()
-
-latest_market = {
+latest = {
     "status": "starting",
     "signals": [],
     "pairs": [],
     "updated": None,
-    "message": "Starting market scanner...",
+    "message": "Starting..."
 }
 
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def log(message):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now} UTC] {message}", flush=True)
+lock = threading.Lock()
+pair_index = 0
 
 
-def round_price(pair, price):
-    return round(price, 3 if "JPY" in pair else 5)
-
-
-def closes(candles):
-    return [c["close"] for c in candles]
+def log(x):
+    print(
+        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] {x}",
+        flush=True
+    )
 
 
 # =========================================================
-# TWELVE DATA
+# DATA
 # =========================================================
 
-def get_data(interval, outputsize):
-    if not API_KEY:
-        return {}
+def get_data(pair, interval, size):
+    key = f"{pair}:{interval}"
 
-    key = f"{interval}:{outputsize}"
-    old = cache.get(key)
-    if old and time.time() - old[0] < CACHE_SECONDS:
-        return old[1]
-
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": ",".join(PAIRS),
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": API_KEY,
-        "order": "asc",
-        "timezone": "UTC",
-    }
+    if key in cache:
+        return cache[key]
 
     try:
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
-        raw = response.json()
-    except Exception as exc:
-        log(f"DATA ERROR {interval}: {exc}")
-        return {}
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": pair,
+                "interval": interval,
+                "outputsize": size,
+                "apikey": API_KEY,
+                "timezone": "UTC"
+            },
+            timeout=20
+        )
 
-    result = {}
-    if not isinstance(raw, dict):
-        return result
+        data = r.json()
 
-    for pair in PAIRS:
-        item = raw.get(pair)
-        if not isinstance(item, dict):
-            continue
+        if "values" not in data:
+            log(f"{pair} {interval}: {data}")
+            return []
 
-        values = item.get("values", [])
         candles = []
 
-        for row in values:
+        for x in reversed(data["values"]):
             try:
                 candles.append({
-                    "datetime": row.get("datetime"),
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
+                    "datetime": x["datetime"],
+                    "open": float(x["open"]),
+                    "high": float(x["high"]),
+                    "low": float(x["low"]),
+                    "close": float(x["close"])
                 })
-            except (KeyError, TypeError, ValueError):
-                continue
+            except:
+                pass
 
-        if candles:
-            result[pair] = candles
+        cache[key] = candles
+        return candles
 
-    cache[key] = (time.time(), result)
-    return result
+    except Exception as e:
+        log(f"DATA ERROR {pair} {interval}: {e}")
+        return []
+
+
+def aggregate(candles, minutes):
+    if not candles:
+        return []
+
+    out = {}
+
+    for c in candles:
+        try:
+            dt = datetime.fromisoformat(
+                c["datetime"].replace("Z", "+00:00")
+            )
+            stamp = int(dt.timestamp() // (minutes * 60))
+        except:
+            continue
+
+        if stamp not in out:
+            out[stamp] = {
+                "datetime": c["datetime"],
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"]
+            }
+        else:
+            out[stamp]["high"] = max(out[stamp]["high"], c["high"])
+            out[stamp]["low"] = min(out[stamp]["low"], c["low"])
+            out[stamp]["close"] = c["close"]
+
+    return list(out.values())
 
 
 # =========================================================
 # INDICATORS
 # =========================================================
 
-def ema(values, period):
-    if len(values) < period:
+def rsi(candles):
+    if len(candles) < RSI_PERIOD + 1:
         return None
 
-    value = sum(values[:period]) / period
-    multiplier = 2.0 / (period + 1)
-
-    for price in values[period:]:
-        value = ((price - value) * multiplier) + value
-
-    return value
-
-
-def rsi(values, period=RSI_PERIOD):
-    if len(values) < period + 1:
-        return None
+    closes = [x["close"] for x in candles]
 
     gains = []
     losses = []
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
+    loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
 
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+    for i in range(RSI_PERIOD, len(gains)):
+        gain = ((gain * 13) + gains[i]) / 14
+        loss = ((loss * 13) + losses[i]) / 14
 
-    if avg_loss == 0:
-        return 100.0
+    if loss == 0:
+        return 100
 
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100 - (100 / (1 + gain / loss))
 
 
-def atr(candles, period=ATR_PERIOD):
-    if len(candles) < period + 1:
+def ema(candles, period):
+    if len(candles) < period:
         return None
 
-    ranges = []
+    prices = [x["close"] for x in candles]
+    value = sum(prices[:period]) / period
+    mult = 2 / (period + 1)
+
+    for p in prices[period:]:
+        value += (p - value) * mult
+
+    return value
+
+
+def atr(candles):
+    if len(candles) < 15:
+        return None
+
+    tr = []
+
     for i in range(1, len(candles)):
-        current = candles[i]
-        previous = candles[i - 1]
-        tr = max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"]),
-        )
-        ranges.append(tr)
+        a = candles[i]
+        b = candles[i - 1]
 
-    if len(ranges) < period:
-        return None
+        tr.append(max(
+            a["high"] - a["low"],
+            abs(a["high"] - b["close"]),
+            abs(a["low"] - b["close"])
+        ))
 
-    return sum(ranges[-period:]) / period
+    return sum(tr[-14:]) / 14
 
 
 # =========================================================
-# MARKET STRUCTURE
+# TREND
 # =========================================================
 
-def bullish_structure(candles):
-    if len(candles) < 20:
-        return False
-
-    first = candles[-20:-10]
-    second = candles[-10:]
-
-    return (
-        max(c["high"] for c in second) > max(c["high"] for c in first)
-        and min(c["low"] for c in second) > min(c["low"] for c in first)
-    )
-
-
-def bearish_structure(candles):
-    if len(candles) < 20:
-        return False
-
-    first = candles[-20:-10]
-    second = candles[-10:]
-
-    return (
-        max(c["high"] for c in second) < max(c["high"] for c in first)
-        and min(c["low"] for c in second) < min(c["low"] for c in first)
-    )
-
-
-def timeframe_direction(candles):
-    if len(candles) < SLOW_EMA + 5:
+def direction(candles):
+    if len(candles) < 55:
         return "NEUTRAL"
 
-    values = closes(candles)
-    fast = ema(values, FAST_EMA)
-    slow = ema(values, SLOW_EMA)
-    price = values[-1]
+    fast = ema(candles, 20)
+    slow = ema(candles, 50)
+    price = candles[-1]["close"]
 
-    if fast is None or slow is None:
-        return "NEUTRAL"
-
-    if fast > slow and price > fast and bullish_structure(candles):
+    if fast > slow and price > fast:
         return "BULLISH"
 
-    if fast < slow and price < fast and bearish_structure(candles):
+    if fast < slow and price < fast:
         return "BEARISH"
 
     return "NEUTRAL"
@@ -271,408 +211,268 @@ def timeframe_direction(candles):
 # SUPPLY / DEMAND
 # =========================================================
 
-def find_demand_zone(candles):
-    if len(candles) < ZONE_LOOKBACK:
-        return None
-
-    current_atr = atr(candles)
-    if not current_atr:
-        return None
-
-    recent = candles[-ZONE_LOOKBACK:]
-
-    for i in range(len(recent) - 4, 0, -1):
-        candle = recent[i]
-        body = abs(candle["close"] - candle["open"])
-
-        if body < current_atr * 0.8:
-            continue
-        if candle["close"] >= candle["open"]:
-            continue
-
-        following = recent[i + 1:i + 4]
-        if not following:
-            continue
-
-        move = max(c["close"] for c in following) - candle["low"]
-        if move >= current_atr * 0.8:
-            return {
-                "low": candle["low"],
-                "high": max(candle["open"], candle["close"]),
-            }
-
-    return None
-
-
-def find_supply_zone(candles):
-    if len(candles) < ZONE_LOOKBACK:
-        return None
-
-    current_atr = atr(candles)
-    if not current_atr:
-        return None
-
-    recent = candles[-ZONE_LOOKBACK:]
-
-    for i in range(len(recent) - 4, 0, -1):
-        candle = recent[i]
-        body = abs(candle["close"] - candle["open"])
-
-        if body < current_atr * 0.8:
-            continue
-        if candle["close"] <= candle["open"]:
-            continue
-
-        following = recent[i + 1:i + 4]
-        if not following:
-            continue
-
-        move = candle["high"] - min(c["close"] for c in following)
-        if move >= current_atr * 0.8:
-            return {
-                "low": min(candle["open"], candle["close"]),
-                "high": candle["high"],
-            }
-
-    return None
-
-
-# =========================================================
-# ENTRY CONFIRMATION
-# =========================================================
-
-def fifteen_minute_confirmation(candles, bias):
-    if len(candles) < 50:
+def demand(candles):
+    if len(candles) < 40:
         return False
 
-    value = rsi(closes(candles))
-    if value is None:
+    a = atr(candles)
+    if not a:
         return False
 
-    if bias == "BULLISH":
-        return 45 <= value <= 68
+    for c in candles[-30:-3]:
+        body = abs(c["close"] - c["open"])
 
-    if bias == "BEARISH":
-        return 32 <= value <= 55
+        if c["close"] < c["open"] and body >= a * 0.8:
+            return True
 
     return False
 
 
-def five_minute_entry(candles, bias):
-    if len(candles) < 60:
-        return None
+def supply(candles):
+    if len(candles) < 40:
+        return False
 
-    value = rsi(closes(candles))
-    current_atr = atr(candles)
+    a = atr(candles)
+    if not a:
+        return False
 
-    if value is None or current_atr is None:
-        return None
+    for c in candles[-30:-3]:
+        body = abs(c["close"] - c["open"])
 
-    current = candles[-1]
-    previous = candles[-2]
+        if c["close"] > c["open"] and body >= a * 0.8:
+            return True
 
-    if bias == "BULLISH":
-        if (
-            current["close"] > current["open"]
-            and previous["close"] < previous["open"]
-            and current["close"] > previous["high"]
-            and 50 <= value <= 70
-        ):
-            return {
-                "direction": "BUY",
-                "entry": current["close"],
-                "atr": current_atr,
-                "rsi": value,
-            }
-
-    if bias == "BEARISH":
-        if (
-            current["close"] < current["open"]
-            and previous["close"] > previous["open"]
-            and current["close"] < previous["low"]
-            and 30 <= value <= 50
-        ):
-            return {
-                "direction": "SELL",
-                "entry": current["close"],
-                "atr": current_atr,
-                "rsi": value,
-            }
-
-    return None
-
-
-# =========================================================
-# TOP-DOWN ANALYSIS
-# =========================================================
-
-def top_down_bias(pair_data):
-    directions = {}
-
-    for name in ("MONTHLY", "WEEKLY", "DAILY", "4H"):
-        directions[name] = timeframe_direction(pair_data.get(name, []))
-
-    bullish = sum(v == "BULLISH" for v in directions.values())
-    bearish = sum(v == "BEARISH" for v in directions.values())
-
-    if bullish >= 3:
-        return "BULLISH", directions
-
-    if bearish >= 3:
-        return "BEARISH", directions
-
-    return "NEUTRAL", directions
-
-
-def signal_score(pair_data, bias, directions, entry):
-    score = 0
-    reasons = []
-
-    weights = {
-        "MONTHLY": 1,
-        "WEEKLY": 2,
-        "DAILY": 2,
-        "4H": 2,
-        "1H": 1,
-    }
-
-    for name, weight in weights.items():
-        if directions.get(name) == bias:
-            score += weight
-            reasons.append(f"{name} agrees")
-
-    if fifteen_minute_confirmation(pair_data.get("15M", []), bias):
-        score += 1
-        reasons.append("15M confirmation")
-
-    candles_5m = pair_data.get("5M", [])
-
-    if bias == "BULLISH" and find_demand_zone(candles_5m):
-        score += 1
-        reasons.append("Demand zone")
-
-    if bias == "BEARISH" and find_supply_zone(candles_5m):
-        score += 1
-        reasons.append("Supply zone")
-
-    if entry:
-        value = entry["rsi"]
-        if bias == "BULLISH" and 50 <= value <= 70:
-            score += 1
-            reasons.append("Bullish RSI")
-        elif bias == "BEARISH" and 30 <= value <= 50:
-            score += 1
-            reasons.append("Bearish RSI")
-
-    return score, reasons
-
-
-# =========================================================
-# TRADE LEVELS
-# =========================================================
-
-def build_trade(pair, entry_data):
-    if not entry_data:
-        return None
-
-    entry = entry_data["entry"]
-    direction = entry_data["direction"]
-    risk = entry_data["atr"] * SL_ATR_MULTIPLIER
-
-    if risk <= 0:
-        return None
-
-    if direction == "BUY":
-        stop = entry - risk
-        target = entry + risk * RR
-        protection = entry + risk * PROTECT_R
-    else:
-        stop = entry + risk
-        target = entry - risk * RR
-        protection = entry - risk * PROTECT_R
-
-    return {
-        "pair": pair,
-        "direction": direction,
-        "entry": round_price(pair, entry),
-        "stop_loss": round_price(pair, stop),
-        "take_profit": round_price(pair, target),
-        "protection_activation": round_price(pair, protection),
-        "risk_distance": round_price(pair, risk),
-        "rr": RR,
-        "protect_r": PROTECT_R,
-    }
+    return False
 
 
 # =========================================================
 # PAIR ANALYSIS
 # =========================================================
 
-def analyze_pair(pair, market_data):
-    pair_data = {}
-
-    for name, interval in TIMEFRAMES.items():
-        pair_data[name] = market_data.get(interval, {}).get(pair, [])
-
-    bias, directions = top_down_bias(pair_data)
-
-    if bias == "NEUTRAL":
+def analyze(pair, m5, daily):
+    if len(m5) < 100 or len(daily) < 60:
         return {
             "pair": pair,
             "status": "WAIT",
-            "bias": bias,
-            "directions": directions,
-            "score": 0,
-            "reasons": ["Higher timeframes are not aligned"],
+            "message": "Loading market data"
         }
 
-    entry = five_minute_entry(pair_data["5M"], bias)
-    score, reasons = signal_score(pair_data, bias, directions, entry)
+    m15 = aggregate(m5, 15)
+    h1 = aggregate(m5, 60)
+    h4 = aggregate(m5, 240)
 
-    if not entry:
+    weekly = aggregate(daily, 10080)
+    monthly = aggregate(daily, 43200)
+
+    dirs = {
+        "MONTHLY": direction(monthly),
+        "WEEKLY": direction(weekly),
+        "DAILY": direction(daily),
+        "4H": direction(h4),
+        "1H": direction(h1)
+    }
+
+    bull = sum(x == "BULLISH" for x in dirs.values())
+    bear = sum(x == "BEARISH" for x in dirs.values())
+
+    if bull >= 3:
+        bias = "BULLISH"
+    elif bear >= 3:
+        bias = "BEARISH"
+    else:
+        return {
+            "pair": pair,
+            "status": "WAIT",
+            "bias": "NEUTRAL",
+            "directions": dirs,
+            "score": 0
+        }
+
+    score = 0
+    reasons = []
+
+    for name, d in dirs.items():
+        if d == bias:
+            score += 1
+            reasons.append(name)
+
+    r15 = rsi(m15)
+    r5 = rsi(m5)
+    a = atr(m5)
+
+    if not r15 or not r5 or not a:
         return {
             "pair": pair,
             "status": "WAIT",
             "bias": bias,
-            "directions": directions,
+            "directions": dirs,
+            "score": score
+        }
+
+    if bias == "BULLISH":
+        if 45 <= r15 <= 68:
+            score += 1
+            reasons.append("15M confirmation")
+
+        if demand(m5):
+            score += 1
+            reasons.append("Demand zone")
+
+        entry_ok = (
+            m5[-1]["close"] > m5[-1]["open"]
+            and m5[-2]["close"] < m5[-2]["open"]
+            and m5[-1]["close"] > m5[-2]["high"]
+            and 50 <= r5 <= 70
+        )
+
+        if entry_ok:
+            score += 2
+            reasons.append("5M BUY confirmation")
+
+    else:
+        if 32 <= r15 <= 55:
+            score += 1
+            reasons.append("15M confirmation")
+
+        if supply(m5):
+            score += 1
+            reasons.append("Supply zone")
+
+        entry_ok = (
+            m5[-1]["close"] < m5[-1]["open"]
+            and m5[-2]["close"] > m5[-2]["open"]
+            and m5[-1]["close"] < m5[-2]["low"]
+            and 30 <= r5 <= 50
+        )
+
+        if entry_ok:
+            score += 2
+            reasons.append("5M SELL confirmation")
+
+    if score < MIN_SCORE or not entry_ok:
+        return {
+            "pair": pair,
+            "status": "WAIT",
+            "bias": bias,
+            "directions": dirs,
             "score": score,
-            "reasons": reasons + ["Waiting for 5M entry confirmation"],
+            "rsi": round(r5, 2),
+            "reasons": reasons
         }
 
-    if score < MIN_SIGNAL_SCORE:
-        return {
-            "pair": pair,
-            "status": "WAIT",
-            "bias": bias,
-            "directions": directions,
-            "score": score,
-            "reasons": reasons + ["Signal quality below minimum"],
-        }
+    entry = m5[-1]["close"]
+    risk = a
 
-    trade = build_trade(pair, entry)
-    if not trade:
-        return {
-            "pair": pair,
-            "status": "WAIT",
-            "bias": bias,
-            "directions": directions,
-            "score": score,
-            "reasons": ["Could not calculate trade levels"],
-        }
+    if bias == "BULLISH":
+        stop = entry - risk
+        target = entry + risk * RR
+        protect = entry + risk * PROTECT_R
+        signal = "BUY"
+    else:
+        stop = entry + risk
+        target = entry - risk * RR
+        protect = entry - risk * PROTECT_R
+        signal = "SELL"
 
-    trade.update({
+    digits = 3 if "JPY" in pair else 5
+
+    return {
+        "pair": pair,
         "status": "SIGNAL",
+        "direction": signal,
         "bias": bias,
         "score": score,
-        "rsi": round(entry["rsi"], 2),
-        "atr": round(entry["atr"], 6),
-        "directions": directions,
+        "entry": round(entry, digits),
+        "stop_loss": round(stop, digits),
+        "take_profit": round(target, digits),
+        "protection_activation": round(protect, digits),
+        "rsi": round(r5, 2),
+        "rr": RR,
+        "protect_r": PROTECT_R,
+        "directions": dirs,
         "reasons": reasons,
-        "time": datetime.now(timezone.utc).isoformat(),
-    })
-
-    return trade
+        "time": datetime.now(timezone.utc).isoformat()
+    }
 
 
 # =========================================================
-# MARKET SCAN
+# SCANNER
 # =========================================================
 
-def scan_market():
-    global latest_market, last_scan
+def scan():
+    global pair_index, latest
 
     if not API_KEY:
-        latest_market = {
-            "status": "error",
-            "signals": [],
-            "pairs": [],
-            "updated": datetime.now(timezone.utc).isoformat(),
-            "message": "TWELVE_DATA_API_KEY is missing",
-        }
+        latest["status"] = "error"
+        latest["message"] = "TWELVE_DATA_API_KEY is missing"
         return
 
-    if not scan_lock.acquire(blocking=False):
-        return
+    batch = PAIRS[pair_index:pair_index + 3]
 
-    try:
-        log("Starting market scan...")
-        market_data = {}
+    if len(batch) < 3:
+        batch += PAIRS[:3 - len(batch)]
 
-        for name, interval in TIMEFRAMES.items():
-            log(f"Loading {name} ({interval})")
-            market_data[interval] = get_data(interval, OUTPUT_SIZE[interval])
+    pair_index = (pair_index + 3) % len(PAIRS)
 
-        results = []
-        signals = []
+    log("Loading: " + ", ".join(batch))
 
-        for pair in PAIRS:
-            try:
-                result = analyze_pair(pair, market_data)
-                results.append(result)
-                if result.get("status") == "SIGNAL":
-                    signals.append(result)
-            except Exception as exc:
-                log(f"ANALYSIS ERROR {pair}: {exc}")
-                results.append({
-                    "pair": pair,
-                    "status": "ERROR",
-                    "message": str(exc),
-                })
+    for pair in batch:
 
-        last_scan = time.time()
-        latest_market = {
-            "status": "ok",
-            "signals": signals,
-            "pairs": results,
-            "updated": datetime.now(timezone.utc).isoformat(),
-            "message": f"Scanned {len(PAIRS)} pairs",
-        }
+        m5 = get_data(pair, "5min", 5000)
 
-        log(f"Scan complete. Signals: {len(signals)}")
+        # Wait briefly so requests are not fired together
+        time.sleep(1)
 
-    finally:
-        scan_lock.release()
+        daily = get_data(pair, "1day", 300)
+
+        if not m5 or not daily:
+            continue
+
+        result = analyze(pair, m5, daily)
+
+        latest["pairs"] = [
+            x for x in latest["pairs"]
+            if x.get("pair") != pair
+        ]
+
+        latest["pairs"].append(result)
+
+    latest["signals"] = [
+        x for x in latest["pairs"]
+        if x.get("status") == "SIGNAL"
+    ]
+
+    latest["status"] = "ok"
+    latest["updated"] = datetime.now(timezone.utc).isoformat()
+    latest["message"] = f"Monitoring {len(PAIRS)} pairs"
+
+    log("Scan complete")
 
 
-# =========================================================
-# BACKGROUND WORKER
-# =========================================================
-
-def background_worker():
-    log("VIC FX background worker started")
-
+def worker():
     while True:
         try:
-            scan_market()
-        except Exception as exc:
-            log(f"BACKGROUND ERROR: {exc}")
+            scan()
+        except Exception as e:
+            log(f"SCAN ERROR: {e}")
 
-        time.sleep(SCAN_SECONDS)
+        # 3 pairs/minute = 6 API credits/minute
+        time.sleep(60)
 
 
-# Gunicorn imports app:app, so start the worker on import.
-_worker = threading.Thread(
-    target=background_worker,
-    name="vic-fx-scanner",
-    daemon=True,
-)
-_worker.start()
+threading.Thread(
+    target=worker,
+    daemon=True
+).start()
 
 
 # =========================================================
-# ROUTES
+# WEB
 # =========================================================
 
 @app.route("/")
 def home():
-    try:
-        return render_template("index.html")
-    except Exception:
-        return jsonify({
-            "name": "VIC FX SIGNALS",
-            "status": "online",
-            "message": "index.html was not found; API is still running",
-        })
+    return render_template("index.html")
 
 
 @app.route("/health")
@@ -682,38 +482,33 @@ def health():
         "bot": "VIC FX SIGNALS",
         "pairs": len(PAIRS),
         "api_key_present": bool(API_KEY),
-        "last_scan": last_scan,
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": datetime.now(timezone.utc).isoformat()
     })
 
 
 @app.route("/api/market")
-def api_market():
-    return jsonify(latest_market)
+def market():
+    return jsonify(latest)
 
 
 @app.route("/api/signals")
-def api_signals():
+def signals():
     return jsonify({
-        "status": latest_market.get("status"),
-        "signals": latest_market.get("signals", []),
-        "updated": latest_market.get("updated"),
-        "message": latest_market.get("message"),
+        "status": latest["status"],
+        "signals": latest["signals"],
+        "updated": latest["updated"],
+        "message": latest["message"]
     })
 
 
 @app.route("/api/pairs")
-def api_pairs():
+def pairs():
     return jsonify({
         "pairs": PAIRS,
-        "count": len(PAIRS),
+        "count": len(PAIRS)
     })
 
 
-# =========================================================
-# LOCAL DEVELOPMENT
-# =========================================================
-
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
