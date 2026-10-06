@@ -1,7 +1,4 @@
-import os
-import time
-import threading
-import requests
+import os, time, threading, requests
 from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string
 
@@ -19,19 +16,25 @@ RR = 2.0
 PROTECT_R = 0.5
 RSI_PERIOD = 14
 
+# SHOW ALL PAIRS IMMEDIATELY
+results = {
+    p: {
+        "pair": p,
+        "status": "WAIT",
+        "message": "Loading market data..."
+    } for p in PAIRS
+}
+
 cache = {}
-results = {}
-index = 0
+pair_index = 0
 lock = threading.Lock()
 
 
-def fetch(symbol, interval, size):
+def td(symbol, interval, size):
     key = (symbol, interval)
     now = time.time()
 
-    ttl = 240 if interval == "5min" else 1800
-
-    if key in cache and now - cache[key][0] < ttl:
+    if key in cache and now - cache[key][0] < 300:
         return cache[key][1]
 
     try:
@@ -42,8 +45,7 @@ def fetch(symbol, interval, size):
                 "interval": interval,
                 "outputsize": size,
                 "apikey": KEY,
-                "timezone": "UTC",
-                "order": "asc"
+                "timezone": "UTC"
             },
             timeout=15
         )
@@ -56,7 +58,7 @@ def fetch(symbol, interval, size):
 
         candles = []
 
-        for x in data["values"]:
+        for x in reversed(data["values"]):
             try:
                 candles.append({
                     "datetime": x["datetime"],
@@ -76,129 +78,125 @@ def fetch(symbol, interval, size):
         return []
 
 
-def aggregate(candles, minutes):
+def aggregate(c, minutes):
     out = {}
 
-    for x in candles:
+    for x in c:
         try:
             t = datetime.fromisoformat(
                 x["datetime"].replace("Z", "+00:00")
             ).timestamp()
 
-            key = int(t // (minutes * 60))
-        except:
-            continue
+            k = int(t // (minutes * 60))
 
-        if key not in out:
-            out[key] = dict(x)
-        else:
-            out[key]["high"] = max(out[key]["high"], x["high"])
-            out[key]["low"] = min(out[key]["low"], x["low"])
-            out[key]["close"] = x["close"]
+            if k not in out:
+                out[k] = dict(x)
+            else:
+                out[k]["high"] = max(out[k]["high"], x["high"])
+                out[k]["low"] = min(out[k]["low"], x["low"])
+                out[k]["close"] = x["close"]
+
+        except:
+            pass
 
     return list(out.values())
 
 
-def ema(candles, period):
-    if len(candles) < period:
+def ema(c, n):
+    if len(c) < n:
         return None
 
-    value = sum(x["close"] for x in candles[:period]) / period
-    multiplier = 2 / (period + 1)
+    v = sum(x["close"] for x in c[:n]) / n
+    m = 2 / (n + 1)
 
-    for x in candles[period:]:
-        value += (x["close"] - value) * multiplier
+    for x in c[n:]:
+        v += (x["close"] - v) * m
 
-    return value
+    return v
 
 
-def rsi(candles):
-    if len(candles) < RSI_PERIOD + 1:
+def rsi(c):
+    if len(c) < 15:
         return None
 
-    prices = [x["close"] for x in candles]
+    p = [x["close"] for x in c]
     gains = []
     losses = []
 
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    for i in range(1, len(p)):
+        d = p[i] - p[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
 
-    gain = sum(gains[:14]) / 14
-    loss = sum(losses[:14]) / 14
+    g = sum(gains[:14]) / 14
+    l = sum(losses[:14]) / 14
 
     for i in range(14, len(gains)):
-        gain = (gain * 13 + gains[i]) / 14
-        loss = (loss * 13 + losses[i]) / 14
+        g = (g * 13 + gains[i]) / 14
+        l = (l * 13 + losses[i]) / 14
 
-    if loss == 0:
+    if l == 0:
         return 100
 
-    return 100 - (100 / (1 + gain / loss))
+    return 100 - 100 / (1 + g / l)
 
 
-def atr(candles):
-    if len(candles) < 15:
+def atr(c):
+    if len(c) < 15:
         return None
 
     tr = []
 
-    for i in range(1, len(candles)):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        pc = candles[i - 1]["close"]
+    for i in range(1, len(c)):
+        h = c[i]["high"]
+        lo = c[i]["low"]
+        pc = c[i - 1]["close"]
 
-        tr.append(
-            max(
-                h - l,
-                abs(h - pc),
-                abs(l - pc)
-            )
-        )
+        tr.append(max(
+            h - lo,
+            abs(h - pc),
+            abs(lo - pc)
+        ))
 
     return sum(tr[-14:]) / 14
 
 
-def trend(candles):
-    if len(candles) < 12:
+def trend(c):
+    if len(c) < 12:
         return "NEUTRAL"
 
-    fast = ema(candles, 5)
-    slow = ema(candles, 10)
+    e1 = ema(c, 5)
+    e2 = ema(c, 10)
+    price = c[-1]["close"]
 
-    if not fast or not slow:
-        return "NEUTRAL"
-
-    price = candles[-1]["close"]
-
-    if fast > slow and price > fast:
+    if e1 > e2 and price > e1:
         return "BULLISH"
 
-    if fast < slow and price < fast:
+    if e1 < e2 and price < e1:
         return "BEARISH"
 
     return "NEUTRAL"
 
 
-def zone(candles, side):
-    if len(candles) < 30:
+def zone(c, side):
+    if len(c) < 30:
         return False
 
-    a = atr(candles)
+    a = atr(c)
 
     if not a:
         return False
 
-    for x in candles[-25:-2]:
+    for x in c[-25:-2]:
+
         body = abs(x["close"] - x["open"])
 
         if side == "BUY":
-            if x["close"] < x["open"] and body >= a * 0.8:
+            if x["close"] < x["open"] and body >= a * .8:
                 return True
 
-        if side == "SELL":
-            if x["close"] > x["open"] and body >= a * 0.8:
+        else:
+            if x["close"] > x["open"] and body >= a * .8:
                 return True
 
     return False
@@ -206,23 +204,23 @@ def zone(candles, side):
 
 def analyze(pair):
 
-    m5 = fetch(pair, "5min", 250)
-    daily = fetch(pair, "1day", 120)
-    weekly = fetch(pair, "1week", 30)
-    monthly = fetch(pair, "1month", 24)
+    m5 = td(pair, "5min", 250)
+    daily = td(pair, "1day", 120)
+    weekly = td(pair, "1week", 30)
+    monthly = td(pair, "1month", 24)
 
-    if len(m5) < 60 or len(daily) < 20:
+    if len(m5) < 50:
         return {
             "pair": pair,
             "status": "WAIT",
-            "message": "Waiting for market data"
+            "message": "Waiting for 5M data"
         }
 
     m15 = aggregate(m5, 15)
     h1 = aggregate(m5, 60)
     h4 = aggregate(m5, 240)
 
-    directions = {
+    dirs = {
         "MONTHLY": trend(monthly),
         "WEEKLY": trend(weekly),
         "DAILY": trend(daily),
@@ -230,12 +228,12 @@ def analyze(pair):
         "1H": trend(h1)
     }
 
-    bullish = sum(v == "BULLISH" for v in directions.values())
-    bearish = sum(v == "BEARISH" for v in directions.values())
+    bull = list(dirs.values()).count("BULLISH")
+    bear = list(dirs.values()).count("BEARISH")
 
-    if bullish >= 3:
+    if bull >= 3:
         bias = "BULLISH"
-    elif bearish >= 3:
+    elif bear >= 3:
         bias = "BEARISH"
     else:
         bias = "NEUTRAL"
@@ -248,39 +246,31 @@ def analyze(pair):
         "pair": pair,
         "status": "WAIT",
         "bias": bias,
-        "directions": directions,
-        "rsi": round(r5, 2) if r5 else None
+        "directions": dirs,
+        "rsi": round(r5, 2) if r5 else None,
+        "message": "Waiting for entry confirmation"
     }
 
     if bias == "NEUTRAL" or not r5 or not r15 or not a:
         return base
 
-    score = sum(
-        v == bias for v in directions.values()
-    )
-
-    reasons = [
-        k for k, v in directions.items()
-        if v == bias
-    ]
+    score = bull if bias == "BULLISH" else bear
+    reasons = []
 
     if bias == "BULLISH":
 
         if 45 <= r15 <= 68:
             score += 1
-            reasons.append("15M confirmation")
+            reasons.append("15M RSI")
 
         if zone(m5, "BUY"):
             score += 1
-            reasons.append("Demand zone")
+            reasons.append("Demand")
 
         entry_ok = (
-            m5[-1]["close"] > m5[-1]["open"]
-            and
-            m5[-2]["close"] < m5[-2]["open"]
-            and
-            m5[-1]["close"] > m5[-2]["high"]
-            and
+            m5[-1]["close"] > m5[-1]["open"] and
+            m5[-2]["close"] < m5[-2]["open"] and
+            m5[-1]["close"] > m5[-2]["high"] and
             50 <= r5 <= 70
         )
 
@@ -290,19 +280,16 @@ def analyze(pair):
 
         if 32 <= r15 <= 55:
             score += 1
-            reasons.append("15M confirmation")
+            reasons.append("15M RSI")
 
         if zone(m5, "SELL"):
             score += 1
-            reasons.append("Supply zone")
+            reasons.append("Supply")
 
         entry_ok = (
-            m5[-1]["close"] < m5[-1]["open"]
-            and
-            m5[-2]["close"] > m5[-2]["open"]
-            and
-            m5[-1]["close"] < m5[-2]["low"]
-            and
+            m5[-1]["close"] < m5[-1]["open"] and
+            m5[-2]["close"] > m5[-2]["open"] and
+            m5[-1]["close"] < m5[-2]["low"] and
             30 <= r5 <= 50
         )
 
@@ -310,21 +297,18 @@ def analyze(pair):
 
     if score < 6 or not entry_ok:
         base["score"] = score
-        base["reasons"] = reasons
         return base
 
     entry = m5[-1]["close"]
-    risk = a
 
     if side == "BUY":
-        stop = entry - risk
-        target = entry + (risk * RR)
-        protect = entry + (risk * PROTECT_R)
-
+        sl = entry - a
+        tp = entry + a * RR
+        protect = entry + a * PROTECT_R
     else:
-        stop = entry + risk
-        target = entry - (risk * RR)
-        protect = entry - (risk * PROTECT_R)
+        sl = entry + a
+        tp = entry - a * RR
+        protect = entry - a * PROTECT_R
 
     digits = 3 if "JPY" in pair else 5
 
@@ -335,141 +319,129 @@ def analyze(pair):
         "bias": bias,
         "score": score,
         "entry": round(entry, digits),
-        "stop_loss": round(stop, digits),
-        "take_profit": round(target, digits),
+        "stop_loss": round(sl, digits),
+        "take_profit": round(tp, digits),
         "protection_activation": round(protect, digits),
         "rsi": round(r5, 2),
         "rr": RR,
         "protect_r": PROTECT_R,
-        "directions": directions,
+        "directions": dirs,
         "reasons": reasons,
         "time": datetime.now(timezone.utc).isoformat()
     }
 
 
-def scan():
+def scanner():
 
-    global index
-
-    if not KEY:
-        print(
-            "ERROR: TWELVE_DATA_API_KEY is missing",
-            flush=True
-        )
-        return
-
-    batch = PAIRS[index:index + 2]
-
-    index = (index + 2) % len(PAIRS)
-
-    print(
-        "Loading:",
-        ", ".join(batch),
-        flush=True
-    )
-
-    for pair in batch:
-
-        result = analyze(pair)
-
-        with lock:
-            results[pair] = result
-
-        time.sleep(1)
-
-    print("Scan complete", flush=True)
-
-
-def worker():
+    global pair_index
 
     while True:
 
+        if not KEY:
+            print("ERROR: TWELVE_DATA_API_KEY missing", flush=True)
+            time.sleep(60)
+            continue
+
+        pair = PAIRS[pair_index]
+        pair_index = (pair_index + 1) % len(PAIRS)
+
+        print("Loading:", pair, flush=True)
+
         try:
-            scan()
+            result = analyze(pair)
+
+            with lock:
+                results[pair] = result
+
+            print("Finished:", pair, flush=True)
 
         except Exception as e:
-            print(
-                "SCAN ERROR:",
-                e,
-                flush=True
-            )
+            print("SCAN ERROR:", e, flush=True)
 
-        time.sleep(60)
+        # One pair at a time = much less API pressure
+        time.sleep(20)
 
 
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-
-<meta name="viewport"
-content="width=device-width,initial-scale=1">
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VIC FX SIGNALS</title>
 
 <style>
-
 body{
 margin:0;
-background:#090b0f;
-color:#eee;
-font-family:Arial;
-padding:18px
+padding:18px;
+background:#080a0e;
+color:white;
+font-family:Arial
 }
 
 h1{
-margin:0;
-color:#00e5a0
+color:#00e6a0;
+margin-bottom:5px
 }
 
 .sub{
 color:#aaa;
-margin:6px 0 18px
+margin-bottom:18px
 }
 
-.bar{
-padding:12px;
+.status{
 background:#151922;
-border-radius:10px
+padding:14px;
+border-radius:12px;
+margin-bottom:15px
 }
 
 .grid{
 display:grid;
 grid-template-columns:
 repeat(auto-fit,minmax(250px,1fr));
-gap:12px;
-margin-top:14px
+gap:12px
 }
 
 .card{
 background:#121620;
 border:1px solid #292e39;
-border-radius:12px;
+border-radius:13px;
 padding:15px
 }
 
+.pair{
+font-size:19px;
+font-weight:bold
+}
+
+.wait{
+color:#ffc107
+}
+
 .buy{
-color:#00e5a0
+color:#00e6a0;
+font-size:22px;
+font-weight:bold
 }
 
 .sell{
-color:#ff5964
+color:#ff5260;
+font-size:22px;
+font-weight:bold
 }
 
-.small{
-color:#9da3ad;
+.data{
+color:#aaa;
 font-size:13px;
-line-height:1.7
+line-height:1.7;
+margin-top:8px
 }
 
 .price{
-font-size:22px;
-font-weight:bold;
+font-size:20px;
 margin:8px 0
 }
-
 </style>
-
 </head>
 
 <body>
@@ -480,93 +452,82 @@ margin:8px 0
 INTRADAY • TOP-DOWN • 5M ENTRY • RSI • SUPPLY & DEMAND
 </div>
 
-<div class="bar" id="status">
-Connecting...
+<div class="status" id="status">
+🟢 ONLINE • Loading market data...
 </div>
 
-<div class="grid" id="grid"></div>
+<div class="grid" id="cards"></div>
 
 <script>
 
-async function load(){
+async function update(){
 
 try{
 
-let r = await fetch(
-'/api/market?x=' + Date.now()
+const r = await fetch(
+"/api/market?t=" + Date.now()
 );
 
-if(!r.ok) throw 0;
+const d = await r.json();
 
-let d = await r.json();
+document.getElementById("status").innerHTML =
+"🟢 ONLINE • " + d.updated;
 
-document.getElementById("status")
-.innerHTML =
-"🟢 ONLINE • " +
-(d.updated || "Scanning...");
+const cards = d.pairs || [];
 
-let a = d.pairs || [];
+document.getElementById("cards").innerHTML =
+cards.map(x => {
 
-document.getElementById("grid")
-.innerHTML = a.map(x => {
+if(x.status === "SIGNAL"){
 
-let c =
-x.status === "SIGNAL"
-?
-(x.direction === "BUY" ? "buy" : "sell")
-:
-"";
+let cls =
+x.direction === "BUY"
+? "buy"
+: "sell";
 
 return `
 <div class="card">
 
-<b>${x.pair}</b>
+<div class="pair">${x.pair}</div>
 
-<span class="${c}">
-${x.direction || x.status}
-</span>
-
-<div class="small">
-Bias: ${x.bias || "—"}
-<br>
-RSI: ${x.rsi || "—"}
-<br>
-Score: ${x.score || 0}
+<div class="${cls}">
+${x.direction}
 </div>
-
-${
-x.status === "SIGNAL"
-
-?
-
-`
 
 <div class="price">
-${x.entry}
+Entry: ${x.entry}
 </div>
 
-<div class="small">
-SL: ${x.stop_loss}
-<br>
-TP: ${x.take_profit}
-<br>
-Protect +0.5R:
-${x.protection_activation}
+<div class="data">
+Bias: ${x.bias}<br>
+RSI: ${x.rsi}<br>
+Score: ${x.score}<br>
+SL: ${x.stop_loss}<br>
+TP: ${x.take_profit}<br>
+Protect +0.5R: ${x.protection_activation}
 </div>
 
-`
-
-:
-
-`
-
-<div class="small">
-Waiting for a confirmed entry.
 </div>
-
-`
+`;
 
 }
+
+return `
+<div class="card">
+
+<div class="pair">${x.pair}</div>
+
+<div class="wait">
+⏳ WAIT
+</div>
+
+<div class="data">
+${x.message || "Scanning..."}
+<br>
+Bias: ${x.bias || "Loading"}
+<br>
+RSI: ${x.rsi || "Loading"}
+</div>
 
 </div>
 `;
@@ -577,17 +538,16 @@ Waiting for a confirmed entry.
 
 catch(e){
 
-document.getElementById("status")
-.innerHTML =
+document.getElementById("status").innerHTML =
 "🔴 CONNECTION ERROR";
 
 }
 
 }
 
-load();
+update();
 
-setInterval(load,15000);
+setInterval(update,15000);
 
 </script>
 
@@ -603,7 +563,6 @@ def home():
 
 @app.route("/health")
 def health():
-
     return jsonify({
         "status": "online",
         "api_key_present": bool(KEY),
@@ -613,19 +572,19 @@ def health():
 
 @app.route("/api/market")
 def market():
-
     with lock:
-        values = list(results.values())
+        data = list(results.values())
 
     return jsonify({
-        "status": "ok" if KEY else "error",
-        "pairs": values,
+        "status": "ok",
+        "pairs": data,
         "signals": [
-            x for x in values
+            x for x in data
             if x.get("status") == "SIGNAL"
         ],
-        "updated":
-            datetime.now(timezone.utc).isoformat()
+        "updated": datetime.now(
+            timezone.utc
+        ).isoformat()
     })
 
 
@@ -633,34 +592,25 @@ def market():
 def signals():
 
     with lock:
-        values = list(results.values())
+        data = list(results.values())
 
     return jsonify({
         "status": "ok",
         "signals": [
-            x for x in values
+            x for x in data
             if x.get("status") == "SIGNAL"
         ]
-    })
-
-
-@app.route("/api/pairs")
-def pairs():
-
-    return jsonify({
-        "pairs": PAIRS,
-        "count": len(PAIRS)
     })
 
 
 if __name__ == "__main__":
 
     threading.Thread(
-        target=worker,
+        target=scanner,
         daemon=True
     ).start()
 
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", "5000"))
-    )
+        )
