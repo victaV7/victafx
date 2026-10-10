@@ -712,5 +712,5 @@ def home():
 def health():
     return jsonify({"status": "ok"})
 
-if name == "main":
+if _name_ == "main":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
