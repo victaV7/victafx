@@ -698,4 +698,5 @@ def background_worker():
 
 
 # Gunicorn imports app:app, so start the worker on import.
-_worker = threading.Thread(target=background_worker,daemon=True)_worker.start()
+_worker = threading.Thread(target=background_worker,
+daemon=True)_worker.start()
