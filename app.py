@@ -706,11 +706,11 @@ _worker.start()
 
 @app.route("/")
 def home():
-return render_template("index.html")
+    return render_template("index.html")
 
 @app.route("/health")
 def health():
-return jsonify({"status": "ok"})
+    return jsonify({"status": "ok"})
 
 if name == "main":
-app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
