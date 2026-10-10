@@ -72,6 +72,19 @@ latest_market = {
     "message": "Starting market scanner...",
 }
 
+# Free-plan safeguards: Twelve Data Basic is 8 credits/minute and 800/day.
+# We use a conservative in-memory budget and keep chart requests cached.
+API_LOCK = threading.Lock()
+api_usage_minute = {"key": None, "credits": 0}
+api_usage_day = {"key": None, "credits": 0}
+CHART_DAILY_LIMIT = 180
+chart_daily_usage = {"key": None, "credits": 0}
+market_store = {interval: {} for interval in TIMEFRAMES.values()}
+chart_cache = {}
+CHART_CACHE_SECONDS = 900
+FREE_DAILY_BUDGET = 760  # leave headroom below the documented 800/day
+SCAN_INTERVAL_SECONDS = 3 * 60 * 60  # full sweep plus staging is about 3h14m
+
 
 # =========================================================
 # HELPERS
@@ -94,29 +107,70 @@ def closes(candles):
 # TWELVE DATA
 # =========================================================
 
-def get_data(interval, outputsize):
+def _quota_key():
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M"), now.strftime("%Y-%m-%d")
+
+
+def _can_spend(credits, purpose="scan"):
+    minute_key, day_key = _quota_key()
+    if api_usage_minute["key"] != minute_key:
+        api_usage_minute.update(key=minute_key, credits=0)
+    if api_usage_day["key"] != day_key:
+        api_usage_day.update(key=day_key, credits=0)
+    if api_usage_minute["credits"] + credits > 8:
+        return False, "Twelve Data free-plan limit is 8 credits/minute; retry next minute"
+    if api_usage_day["credits"] + credits > FREE_DAILY_BUDGET:
+        return False, "Local safety limit reached for today's Twelve Data budget"
+    if purpose == "chart":
+        if chart_daily_usage["key"] != day_key:
+            chart_daily_usage.update(key=day_key, credits=0)
+        if chart_daily_usage["credits"] + credits > CHART_DAILY_LIMIT:
+            return False, "Chart refresh budget reached for today; cached candles remain available"
+    return True, ""
+
+
+def get_data(interval, outputsize, symbols=None, purpose="scan"):
+    """Fetch one small batch, respecting the free-plan 8-credit/minute cap."""
     if not API_KEY:
         return {}
-
-    key = f"{interval}:{outputsize}"
-    old = cache.get(key)
-    if old and time.time() - old[0] < CACHE_SECONDS:
+    symbols = list(symbols or PAIRS)
+    if not symbols:
+        return {}
+    cache_key = f"{interval}:{outputsize}:{','.join(symbols)}"
+    old = cache.get(cache_key)
+    ttl = CHART_CACHE_SECONDS if purpose == "chart" else 60
+    if old and time.time() - old[0] < ttl:
         return old[1]
+
+    with API_LOCK:
+        allowed, reason = _can_spend(len(symbols), purpose)
+        if not allowed:
+            log(f"API THROTTLE {interval}: {reason}")
+            return {}
+        # Reserve locally before the request so simultaneous chart/scanner calls cannot overspend.
+        minute_key, day_key = _quota_key()
+        api_usage_minute["credits"] += len(symbols)
+        api_usage_day["credits"] += len(symbols)
+        if purpose == "chart":
+            chart_daily_usage["credits"] += len(symbols)
 
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": ",".join(PAIRS),
+        "symbol": ",".join(symbols),
         "interval": interval,
-        "outputsize": outputsize,
+        "outputsize": min(int(outputsize), 250),
         "apikey": API_KEY,
         "order": "asc",
         "timezone": "UTC",
     }
-
     try:
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
+        response = requests.get(url, params=params, timeout=25)
         raw = response.json()
+        if response.status_code == 429 or (isinstance(raw, dict) and raw.get("code") == 429):
+            log(f"DATA ERROR {interval}: Twelve Data returned HTTP 429. Request is throttled; cached data will be kept.")
+            return {}
+        response.raise_for_status()
     except Exception as exc:
         log(f"DATA ERROR {interval}: {exc}")
         return {}
@@ -124,16 +178,12 @@ def get_data(interval, outputsize):
     result = {}
     if not isinstance(raw, dict):
         return result
-
-    for pair in PAIRS:
+    for pair in symbols:
         item = raw.get(pair)
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not item.get("values"):
             continue
-
-        values = item.get("values", [])
         candles = []
-
-        for row in values:
+        for row in item.get("values", []):
             try:
                 candles.append({
                     "datetime": row.get("datetime"),
@@ -144,11 +194,9 @@ def get_data(interval, outputsize):
                 })
             except (KeyError, TypeError, ValueError):
                 continue
-
         if candles:
             result[pair] = candles
-
-    cache[key] = (time.time(), result)
+    cache[cache_key] = (time.time(), result)
     return result
 
 
@@ -578,170 +626,77 @@ def analyze_pair(pair, market_data):
 # MARKET SCAN
 # =========================================================
 
-def scan_market():
+def _refresh_analysis():
     global latest_market, last_scan
+    results, signals = [], []
+    # Never interpret missing timeframe data as a valid neutral market.
+    for pair in PAIRS:
+        available = [market_store.get(interval, {}).get(pair, []) for interval in TIMEFRAMES.values()]
+        if any(len(candles) < 20 for candles in available):
+            results.append({"pair": pair, "status": "WAIT", "bias": "DATA LOADING",
+                            "score": 0, "reasons": ["Waiting for the next free-plan data refresh"]})
+            continue
+        try:
+            result = analyze_pair(pair, market_store)
+            results.append(result)
+            if result.get("status") == "SIGNAL":
+                signals.append(result)
+        except Exception as exc:
+            log(f"ANALYSIS ERROR {pair}: {exc}")
+            results.append({"pair": pair, "status": "ERROR", "message": str(exc)})
+    last_scan = time.time()
+    latest_market = {
+        "status": "ok" if any(market_store.get(i) for i in TIMEFRAMES.values()) else "starting",
+        "signals": signals,
+        "pairs": results,
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "message": "Free-plan mode: staged refresh; signal scan updates after timeframe data is available",
+    }
 
+
+def scan_market():
     if not API_KEY:
-        latest_market = {
-            "status": "error",
-            "signals": [],
-            "pairs": [],
-            "updated": datetime.now(timezone.utc).isoformat(),
-            "message": "TWELVE_DATA_API_KEY is missing",
-        }
+        log("ERROR: TWELVE_DATA_API_KEY is missing")
         return
+    log("Starting low-usage staged market refresh")
+    # 12 pairs are split into batches of 8 and 4. One batch per minute keeps
+    # each minute at or below the Basic plan's 8 credits/minute.
+    batches = [PAIRS[:8], PAIRS[8:]]
+    for name, interval in TIMEFRAMES.items():
+        for batch in batches:
+            # Respect UTC minute reset; no rapid retries on a full quota.
+            minute_key, _ = _quota_key()
+            wait = 60 - (time.time() % 60) + 1
+            allowed, reason = _can_spend(len(batch), "scan")
+            if not allowed and "next minute" in reason:
+                time.sleep(max(1, wait))
+            allowed, reason = _can_spend(len(batch), "scan")
+            if not allowed:
+                log(f"Skipping batch {interval}: {reason}")
+                continue
+            log(f"Loading {name} ({interval}) for {len(batch)} pairs")
+            data = get_data(interval, OUTPUT_SIZE[interval], batch, "scan")
+            for pair, candles in data.items():
+                market_store.setdefault(interval, {})[pair] = candles
+            _refresh_analysis()
+            # Keep one batch per minute even if a request finishes quickly.
+            elapsed = time.time() % 60
+            time.sleep(max(1, 61 - elapsed))
+    log("Staged market refresh complete")
 
-    if not scan_lock.acquire(blocking=False):
-        return
-
-    try:
-        log("Starting market scan...")
-        market_data = {}
-
-        for name, interval in TIMEFRAMES.items():
-            log(f"Loading {name} ({interval})")
-            market_data[interval] = get_data(interval, OUTPUT_SIZE[interval])
-
-        results = []
-        signals = []
-
-        for pair in PAIRS:
-            try:
-                result = analyze_pair(pair, market_data)
-                results.append(result)
-                if result.get("status") == "SIGNAL":
-                    signals.append(result)
-            except Exception as exc:
-                log(f"ANALYSIS ERROR {pair}: {exc}")
-                results.append({
-                    "pair": pair,
-                    "status": "ERROR",
-                    "message": str(exc),
-                })
-
-        last_scan = time.time()
-        latest_market = {
-            "status": "ok",
-            "signals": signals,
-            "pairs": results,
-            "updated": datetime.now(timezone.utc).isoformat(),
-            "message": f"Scanned {len(PAIRS)} pairs",
-        }
-
-        log(f"Scan complete. Signals: {len(signals)}")
-
-    finally:
-        scan_lock.release()
-
-
-# =========================================================
-# BACKGROUND WORKER
-# =========================================================
 
 def background_worker():
-    log("VIC FX background worker started")
-
+    log("VIC FX free-plan background worker started")
     while True:
         try:
             scan_market()
         except Exception as exc:
             log(f"BACKGROUND ERROR: {exc}")
-
-        time.sleep(SCAN_SECONDS)
+        # Full scan uses roughly 84 credits. Three-hour cadence leaves room for
+        # chart requests under the free 800-credit daily allowance.
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
 
 # Gunicorn imports app:app, so start the worker on import.
 _worker = threading.Thread(
-    target=background_worker,
-    name="vic-fx-scanner",
-    daemon=True,
-)
-_worker.start()
-
-
-# =========================================================
-# ROUTES
-# =========================================================
-
-@app.route("/")
-def home():
-    try:
-        return render_template("index.html")
-    except Exception:
-        return jsonify({
-            "name": "VIC FX SIGNALS",
-            "status": "online",
-            "message": "index.html was not found; API is still running",
-        })
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "online",
-        "bot": "VIC FX SIGNALS",
-        "pairs": len(PAIRS),
-        "api_key_present": bool(API_KEY),
-        "last_scan": last_scan,
-        "time": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-@app.route("/api/market")
-def api_market():
-    return jsonify(latest_market)
-
-
-@app.route("/api/signals")
-def api_signals():
-    return jsonify({
-        "status": latest_market.get("status"),
-        "signals": latest_market.get("signals", []),
-        "updated": latest_market.get("updated"),
-        "message": latest_market.get("message"),
-    })
-
-
-@app.route("/api/pairs")
-def api_pairs():
-    return jsonify({
-        "pairs": PAIRS,
-        "count": len(PAIRS),
-    })
-
-
-@app.route("/api/chart")
-def api_chart():
-    """Return real Twelve Data OHLC candles for the website chart."""
-    pair = request.args.get("pair", "EUR/USD").upper().replace(" ", "")
-    interval = request.args.get("interval", "5min")
-    allowed_intervals = {"1month", "1week", "1day", "4h", "1h", "15min", "5min"}
-    if pair not in PAIRS:
-        return jsonify({"error": "Unsupported currency pair", "candles": []}), 400
-    if interval not in allowed_intervals:
-        return jsonify({"error": "Unsupported timeframe", "candles": []}), 400
-    data = get_data(interval, OUTPUT_SIZE.get(interval, 250))
-    candles = data.get(pair, [])
-    output = []
-    for candle in candles:
-        try:
-            dt = datetime.strptime(candle["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            output.append({
-                "time": int(dt.timestamp()),
-                "open": candle["open"],
-                "high": candle["high"],
-                "low": candle["low"],
-                "close": candle["close"],
-            })
-        except (TypeError, ValueError, KeyError):
-            continue
-    return jsonify({"pair": pair, "interval": interval, "candles": output, "count": len(output)})
-
-
-# =========================================================
-# LOCAL DEVELOPMENT
-# =========================================================
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    target=background_worker
