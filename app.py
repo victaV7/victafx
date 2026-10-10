@@ -698,5 +698,19 @@ def background_worker():
 
 
 # Gunicorn imports app:app, so start the worker on import.
-_worker = threading.Thread(target=background_worker,
-daemon=True)_worker.start()
+_worker = threading.Thread(
+target=background_worker,
+daemon=True
+)
+_worker.start()
+
+@app.route("/")
+def home():
+return render_template("index.html")
+
+@app.route("/health")
+def health():
+return jsonify({"status": "ok"})
+
+if name == "main":
+app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
